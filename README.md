@@ -10,7 +10,7 @@ the actual dApp content still moves peer-to-peer over `iroh-blobs`.
 
 ## Trust model
 
-Every announced app is verified with the exact SmartHoldem / ARK crypto used by
+Every announced app is verified with the exact SmartHoldem used by
 the client. A spoofed announcement is rejected:
 
 1. `id == base58check(0x3F ‖ ripemd160(secp256k1 compressed pubkey))`
