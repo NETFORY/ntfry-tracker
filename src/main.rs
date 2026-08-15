@@ -4,7 +4,7 @@
  * SmartNet // lightweight P2P discovery tracker
  *
  *   A standalone Rust (axum) bootstrap directory for WAN dApp discovery.
- *   It does NOT store blobs - only an in-memory registry of signed app
+ *   It does NOT store blobs — only an in-memory registry of signed app
  *   announcements with a TTL heartbeat. Peers announce which dApps they
  *   serve (and their iroh endpointId); other peers query the registry to
  *   discover providers they could not reach over LAN mDNS.
@@ -15,11 +15,11 @@
  *       against that pubkey. Spoofed announcements are rejected.
  *
  *   Endpoints:
- *     POST /announce   - heartbeat: register/refresh the apps a node serves
- *     GET  /apps       - all known apps (deduped) with seed counts + providers
- *     GET  /app/:id    - providers for a single app id
- *     GET  /seeds      - distinct live nodes (endpoints) seen recently
- *     GET  /health     - liveness + registry stats
+ *     POST /announce   — heartbeat: register/refresh the apps a node serves
+ *     GET  /apps       — all known apps (deduped) with seed counts + providers
+ *     GET  /app/:id    — providers for a single app id
+ *     GET  /seeds      — distinct live nodes (endpoints) seen recently
+ *     GET  /health     — liveness + registry stats
  *
  *   Defaults: bind 0.0.0.0:7374, announcement TTL 120s (override via env
  *   SMARTNET_TRACKER_PORT / SMARTNET_TRACKER_TTL).
@@ -50,7 +50,7 @@ const DEFAULT_TTL_SECS: u64 = 120;
 // ---- Anti-spam payment verification (Phase B) ----
 /// Public SmartHoldem node REST base.
 const STH_API: &str = "https://node0.smartholdem.io/api";
-/// Global Sapps escrow node - publish payments (memo `sth:<app_id>`) land here.
+/// Global Sapps escrow node — publish payments (memo `sth:<app_id>`) land here.
 const ESCROW_ADDRESS: &str = "SappsPqDQXCRvoi1V2Hs9xycQeT1ptJWV1";
 /// Admin wallet allowed to broadcast price directives (sender).
 const ORACLE_SENDER: &str = "SeZLuyhhYf2qxs4ArPJ71oEu3x8EsVw51C";
@@ -60,7 +60,7 @@ const ORACLE_RECIPIENT: &str = "SeTQeEAsHnHU1Y9EBjkRVNPB3fmUvfFUrk";
 const OFFICIAL_DEVS_ADDR: &str = "SdevsH3kMbcCFWnyYVtD2UYnBQQm66MxDn";
 /// Official Repository: on-chain registry of explicitly approved dApp ids.
 const OFFICIAL_DAPPS_ADDR: &str = "SdAppjWaQf4v2JjuubvtwsKe3yuUCuq8i8";
-/// Dynamic-pricing defaults - aligned with the live governance directive
+/// Dynamic-pricing defaults — aligned with the live governance directive
 /// `sth_oracle:price_mb=2:base=10`. Total = base + round(MB) * price_mb.
 const DEFAULT_BASE_PRICE: u64 = 10; // whole STH
 const DEFAULT_PRICE_PER_MB: u64 = 2; // whole STH per (rounded) MB
@@ -71,7 +71,7 @@ const SMARTHOSHI: u64 = 100_000_000; // 1 STH = 1e8 smarthoshi
 /// direct `sth://<app_id>` deep link (GET /app/{id}). Flip to surface everything.
 const SHOW_ALL_APPS: bool = false;
 
-// ---- Per-app 5-day paid seeding window (Phase G - per-app payout model) ----
+// ---- Per-app 5-day paid seeding window (Phase G — per-app payout model) ----
 /// Оплаченный период сидинга одного события финансирования (публикация/обновление).
 const SEEDING_WINDOW_SECS: u64 = 5 * 86_400; // 5 дней
 /// Как долго храним funding-события для дедупликации txid (окно + запас).
@@ -112,9 +112,15 @@ struct AppAnnounce {
     /// secp256k1 compressed public key (hex).
     #[serde(rename = "publicKey")]
     public_key: String,
-    /// developer address (manifest owner) - Official Repository filter input.
+    /// developer address (manifest owner) — Official Repository filter input.
     #[serde(default)]
     owner: String,
+    /// iroh-hash логотипа dApp (PNG-блоб) — прозрачный проброс, НЕ в подписи.
+    #[serde(default)]
+    logo: String,
+    /// iroh-hash DAPP Preview 440×180 (PNG/JPG-блоб) — прозрачный проброс.
+    #[serde(default)]
+    preview: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,12 +136,12 @@ struct AnnounceRequest {
     metrics_url: String,
     apps: Vec<AppAnnounce>,
     /// A few (≤8) live Mainline DHT node addrs (ip:port) from the announcer's
-    /// routing table - pooled by the tracker and served via GET /dht so censored
+    /// routing table — pooled by the tracker and served via GET /dht so censored
     /// peers (blocked from public routers/seeder, DHT=0) can still bootstrap off
     /// fresh, hard-to-blanket-block random DHT nodes. Anti-spam: capped + validated.
     #[serde(default)]
     dht: Vec<String>,
-    /// This announcer's OWN public DHT bootstrap addr (ip:port) - set by SmartNet
+    /// This announcer's OWN public DHT bootstrap addr (ip:port) — set by SmartNet
     /// seeders running an open DHT server. Pooled + served via GET /seeders-dht so
     /// fresh clients auto-discover working seeders (no manual config needed).
     #[serde(rename = "seederDht", default)]
@@ -188,10 +194,10 @@ struct AppOut {
     /// unix-время первой оплаты (начало 5-дневного окна публикации).
     #[serde(rename = "paidTs")]
     paid_ts: u64,
-    /// суммарный банк АКТИВНЫХ окон (funding) + буст, в STH - к раздаче сидерам.
+    /// суммарный банк АКТИВНЫХ окон (funding) + буст, в STH — к раздаче сидерам.
     #[serde(rename = "bankSth")]
     bank_sth: u64,
-    /// дневной пул приложения (bank / 5), STH - информативно.
+    /// дневной пул приложения (bank / 5), STH — информативно.
     #[serde(rename = "dailyPoolSth")]
     daily_pool_sth: f64,
     /// секунд до конца самого позднего активного окна оплаченного сидинга (0 = истёк).
@@ -204,6 +210,12 @@ struct AppOut {
     owner: String,
     /// Official Repository: owner ∈ trusted developers OR id ∈ approved dApps.
     official: bool,
+    /// iroh-hash логотипа dApp ('' скрывается из ответа).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    logo: String,
+    /// iroh-hash DAPP Preview 440×180 ('' скрывается из ответа).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    preview: String,
 }
 
 /// Активное событие финансирования в выдаче API (для payout-сервера).
@@ -251,7 +263,7 @@ struct Provider {
     /// app version this provider serves (for update propagation).
     #[serde(default)]
     version: u32,
-    /// last heartbeat (unix secs) - persisted so providers survive restarts.
+    /// last heartbeat (unix secs) — persisted so providers survive restarts.
     #[serde(default)]
     last_seen: u64,
     /// runtime expiry; NOT persisted (recomputed on load from last_seen + ttl).
@@ -278,7 +290,7 @@ struct AppRecord {
     /// accumulated seeding boost (smarthoshi) from `sth_boost:<id>` txs (Phase D).
     #[serde(default)]
     boost_pool_sth: u64,
-    /// total payload size in bytes (latest announced) - used for dynamic pricing.
+    /// total payload size in bytes (latest announced) — used for dynamic pricing.
     #[serde(default)]
     size_bytes: u64,
     /// dynamic republish cost in whole STH (base + round(MB)·price_mb), recomputed
@@ -288,7 +300,7 @@ struct AppRecord {
     /// computed seeding priority weight (100 base + 1/boosted-STH).
     #[serde(default)]
     priority_weight: u32,
-    /// unix-время первой оплаты (paid_ts) - начало отсчёта первого 5-дневного окна.
+    /// unix-время первой оплаты (paid_ts) — начало отсчёта первого 5-дневного окна.
     #[serde(default)]
     paid_ts: u64,
     /// события финансирования (публикация + платные обновления/reseeding).
@@ -300,6 +312,12 @@ struct AppRecord {
     /// developer address (manifest owner) from the latest announce.
     #[serde(default)]
     owner: String,
+    /// iroh-hash логотипа из последнего анонса ('' у легаси).
+    #[serde(default)]
+    logo: String,
+    /// iroh-hash DAPP Preview из последнего анонса ('' у легаси).
+    #[serde(default)]
+    preview: String,
 }
 
 /// Одно событие финансирования приложения (транзакция `sth:<id>` на escrow).
@@ -312,7 +330,7 @@ struct FundingEvent {
     /// сумма банка события в smarthoshi.
     #[serde(rename = "amount")]
     amount_smarthoshi: u64,
-    /// on-chain id транзакции - ключ дедупликации (одна tx = одно событие).
+    /// on-chain id транзакции — ключ дедупликации (одна tx = одно событие).
     #[serde(default)]
     txid: String,
 }
@@ -334,7 +352,7 @@ struct SeederEntry {
     bytes_seeded: u64,
     gb_seeded: f64,
     uptime_secs: u64,
-    /// disk budget (GB) this seeder advertises - summed for global capacity.
+    /// disk budget (GB) this seeder advertises — summed for global capacity.
     storage_limit_gb: f64,
     /// Byte-Hours ranking score: gb_seeded × (uptime_secs / 3600).
     score: f64,
@@ -361,7 +379,7 @@ struct AppState {
     /// log every accepted/rejected announce (toggle via env at startup)
     log_announce: bool,
     stats: Arc<Stats>,
-    /// sled DB - persists the app directory so it survives restarts.
+    /// sled DB — persists the app directory so it survives restarts.
     db: sled::Db,
     /// live seeders (Network Map): endpoint_id -> contribution metrics.
     seeders: Arc<Mutex<HashMap<String, SeederEntry>>>,
@@ -452,6 +470,9 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     r
 }
 
+/// Маркер reveal-payload приватного dApp в description анонса.
+const PRIV_REVEAL_MARKER: &str = "§P1§";
+
 fn address_from_pubkey(pk_comp: &[u8]) -> String {
     let mut rip = Ripemd160::new();
     rip.update(pk_comp);
@@ -464,8 +485,8 @@ fn address_from_pubkey(pk_comp: &[u8]) -> String {
 
 /// Validate a single announcement: the id must be the address derived from
 /// the pubkey and the ECDSA signature must verify. Two canons are accepted:
-///   v2 `id|name|description|merkle|owner` → Ok(true)  - owner is signature-backed;
-///   v1 `id|name|description|merkle`       → Ok(false) - legacy announce, the
+///   v2 `id|name|description|merkle|owner` → Ok(true)  — owner is signature-backed;
+///   v1 `id|name|description|merkle`       → Ok(false) — legacy announce, the
 ///     unsigned `owner` claim MUST be ignored (no Official badge by owner).
 fn verify_announce(a: &AppAnnounce) -> Result<bool, &'static str> {
     let pk_bytes = hex::decode(a.public_key.trim()).map_err(|_| "bad-pubkey-hex")?;
@@ -487,6 +508,18 @@ fn verify_announce(a: &AppAnnounce) -> Result<bool, &'static str> {
     }
     if check(format!("{}|{}|{}|{}", a.id, a.name, a.description, a.merkle)) {
         return Ok(false);
+    }
+    // Приватный dApp: description несёт reveal-payload (маркер §P1§…), который
+    // НЕ входит в подпись манифеста — канон подписан с ПУСТЫМ description.
+    // Имя/merkle/owner остаются под подписью; сам payload защищён E2EE —
+    // подмена ломает расшифровку у участников (fail-closed скрывает dApp).
+    if a.description.starts_with(PRIV_REVEAL_MARKER) {
+        if check(format!("{}|{}||{}|{}", a.id, a.name, a.merkle, a.owner)) {
+            return Ok(true);
+        }
+        if check(format!("{}|{}||{}", a.id, a.name, a.merkle)) {
+            return Ok(false);
+        }
     }
     Err("sig-verify-failed")
 }
@@ -555,7 +588,7 @@ fn load_tombstones(db: &sled::Db) -> HashMap<String, u64> {
 // ============================================================
 
 // ============================================================
-//  Official Repository - on-chain registries of trusted developers
+//  Official Repository — on-chain registries of trusted developers
 //  and approved dApps (scanned on boot + every 24h; persisted in sled).
 // ============================================================
 
@@ -577,7 +610,7 @@ fn looks_like_sth_address(s: &str) -> bool {
 }
 
 /// Scan one registry address over the node pool (SMARTHOLDEM_NODES env or the
-/// default mainnet pool) - never a single hard-coded node.
+/// default mainnet pool) — never a single hard-coded node.
 fn official_scan_registry(recipient: &str) -> Result<Vec<String>, String> {
     let nodes: Vec<String> = std::env::var("SMARTHOLDEM_NODES")
         .ok()
@@ -598,54 +631,66 @@ fn official_scan_registry(recipient: &str) -> Result<Vec<String>, String> {
             ]
         });
     let mut last_err = String::from("no nodes");
-    for host in nodes {
-        let url = format!(
-            "https://{}/api/transactions?recipientId={}&senderId={}&page=1&limit=100&orderBy=timestamp:desc",
-            host, recipient, ORACLE_SENDER
-        );
-        match ureq::get(&url).timeout(Duration::from_secs(12)).call() {
-            Ok(r) => {
-                // ureq без feature "json": строка → serde_json
-                let txt = match r.into_string() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        last_err = e.to_string();
-                        continue;
-                    }
-                };
-                let v: serde_json::Value = match serde_json::from_str(&txt) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        last_err = e.to_string();
-                        continue;
-                    }
-                };
-                let mut out: Vec<String> = Vec::new();
-                if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
-                    for tx in arr {
-                        if tx.get("sender").and_then(|s| s.as_str()) != Some(ORACLE_SENDER) {
-                            continue;
-                        }
-                        let vf = tx
-                            .get("vendorField")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if looks_like_sth_address(&vf) && !out.contains(&vf) {
-                            out.push(vf);
-                        }
-                    }
+    'hosts: for host in nodes {
+        // Пагинация: реестр может превышать 100 tx — идём до meta.pageCount
+        // (cap 50 страниц). Ошибка любой страницы → следующий узел пула:
+        // частичный результат опасен, снапшот реестра заменяется целиком.
+        let mut out: Vec<String> = Vec::new();
+        let mut page: u64 = 1;
+        loop {
+            let url = format!(
+                "https://{}/api/transactions?recipientId={}&senderId={}&page={}&limit=100&orderBy=timestamp:desc",
+                host, recipient, ORACLE_SENDER, page
+            );
+            let resp = match ureq::get(&url).timeout(Duration::from_secs(12)).call() {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue 'hosts;
                 }
+            };
+            // ureq без feature "json": строка → serde_json
+            let txt = match resp.into_string() {
+                Ok(t) => t,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue 'hosts;
+                }
+            };
+            let v: serde_json::Value = match serde_json::from_str(&txt) {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue 'hosts;
+                }
+            };
+            let arr = v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            for tx in &arr {
+                if tx.get("sender").and_then(|s| s.as_str()) != Some(ORACLE_SENDER) {
+                    continue;
+                }
+                let vf = tx
+                    .get("vendorField")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if looks_like_sth_address(&vf) && !out.contains(&vf) {
+                    out.push(vf);
+                }
+            }
+            let page_count =
+                v.pointer("/meta/pageCount").and_then(|p| p.as_u64()).unwrap_or(page);
+            if arr.is_empty() || page >= page_count || page >= 50 {
                 return Ok(out);
             }
-            Err(e) => last_err = e.to_string(),
+            page += 1;
         }
     }
     Err(last_err)
 }
 
-/// Env seed developers (DEVELOPERS=addr1,addr2) + the admin - blockchain-down fallback.
+/// Env seed developers (DEVELOPERS=addr1,addr2) + the admin — blockchain-down fallback.
 fn official_env_devs() -> HashSet<String> {
     let mut set: HashSet<String> = std::env::var("DEVELOPERS")
         .ok()
@@ -712,7 +757,7 @@ fn now_unix() -> u64 {
 }
 
 // ============================================================
-//  Phase F - signed heartbeats + 24h sliding window + K_up
+//  Phase F — signed heartbeats + 24h sliding window + K_up
 // ============================================================
 
 const HB_SLOTS: u64 = 288; // 24h / 5min
@@ -731,15 +776,15 @@ struct Heartbeat {
     #[serde(rename = "publicKey")]
     public_key: String,
     signature: String,
-    /// Self-reported disk budget (GB). Unsigned - informational, folded into the
+    /// Self-reported disk budget (GB). Unsigned — informational, folded into the
     /// global capacity meter so home "client" nodes count, not just headless.
     #[serde(rename = "storageLimitGb", default)]
     storage_limit_gb: f64,
-    /// Self-reported volume actually seeded (GB). Unsigned - folded into the
+    /// Self-reported volume actually seeded (GB). Unsigned — folded into the
     /// global "seeded · 24h" usage meter for home nodes.
     #[serde(rename = "seededGb", default)]
     seeded_gb: f64,
-    /// Self-reported accumulated torrent Byte-Hours (GiB·h). Unsigned - used as
+    /// Self-reported accumulated torrent Byte-Hours (GiB·h). Unsigned — used as
     /// this home node's leaderboard score so it ranks alongside headless seeders
     /// (whose score = GB seeded × uptime hours). Same self-report trust model.
     #[serde(rename = "byteHours", default)]
@@ -826,7 +871,7 @@ fn compute_k_up(active_slots: u32, incentivized: bool) -> f64 {
     if !incentivized {
         return 1.0;
     }
-    // Non-linear uptime penalty curve - MUST stay identical to the Layer-2 payout
+    // Non-linear uptime penalty curve — MUST stay identical to the Layer-2 payout
     // server (payments-server/src/payout.js) so the in-app "Earn STH" estimate
     // matches what a node is actually paid:
     //   98–100% → 2.5 | 90–97.9% → 1.0 | 70–89.9% → 0.3 | <70% → 0.0 (evicted).
@@ -847,14 +892,14 @@ fn hb_key(addr: &str) -> Vec<u8> {
 }
 
 // ============================================================
-//  Phase G - per-app-per-seeder seeding statistics
+//  Phase G — per-app-per-seeder seeding statistics
 //
 //  Из подписанных heartbeat'ов (active_app_ids) трекер ведёт по каждой паре
 //  (app_id, reward_address) посуточные бакеты онлайна: сколько секунд адрес
 //  реально сидировал это приложение в конкретный день. Это источник правды для
 //  payout-сервера: дневной вес сидера = онлайн-секунды за день; правило «12ч
 //  офлайна» считается от first_ts (первого дня раздачи), поэтому подключение в
-//  середине периода корректно оплачивается. Аптайм подписан ключом адреса -
+//  середине периода корректно оплачивается. Аптайм подписан ключом адреса —
 //  подделать чужой аптайм нельзя.
 // ============================================================
 
@@ -945,7 +990,7 @@ async fn seeder_heartbeat(
     }
 
     // Phase G: посуточная статистика раздачи по каждому активному приложению
-    // (кап 200 id/heartbeat - анти-спам, хотя heartbeat уже подписан адресом).
+    // (кап 200 id/heartbeat — анти-спам, хотя heartbeat уже подписан адресом).
     for app_id in hb.active_app_ids.iter().take(200) {
         let id = app_id.trim();
         if !id.is_empty() {
@@ -964,7 +1009,7 @@ async fn seeder_heartbeat(
         let uptime_secs = active_slots * HB_SLOT_SECS;
         let mut map = state.seeders.lock().unwrap();
         // Don't shadow a headless seeder that already advertises /metrics for the
-        // same reward address - just refresh its liveness instead of adding a dup.
+        // same reward address — just refresh its liveness instead of adding a dup.
         let headless_key = map
             .iter()
             .find(|(_, e)| e.node == hb.reward_address && !e.metrics_url.trim().is_empty())
@@ -999,7 +1044,7 @@ async fn seeder_heartbeat(
             e.storage_limit_gb = hb.storage_limit_gb.max(0.0);
             e.gb_seeded = hb.seeded_gb.max(0.0);
             // Home nodes rank by the real torrent Byte-Hours (GiB·h) they report
-            // in the heartbeat - so they compete on the public /map leaderboard
+            // in the heartbeat — so they compete on the public /map leaderboard
             // alongside headless seeders (score = GB × uptime hours). Absent that,
             // fall back to a tiny uptime score so they never outrank GB-backed servers.
             e.score = if hb.byte_hours > 0.0 {
@@ -1069,7 +1114,7 @@ async fn announce(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
-    // Snapshot of currently-tombstoned ids - owner-deleted apps must NOT be
+    // Snapshot of currently-tombstoned ids — owner-deleted apps must NOT be
     // re-created by other seeders' announces while the tombstone is live.
     let tombstoned: std::collections::HashSet<String> = {
         let now = now_unix();
@@ -1100,7 +1145,7 @@ async fn announce(
                     continue;
                 }
             };
-            // owner учитывается ТОЛЬКО когда покрыт подписью (canon v2) -
+            // owner учитывается ТОЛЬКО когда покрыт подписью (canon v2) —
             // легаси-анонс с приписанным owner не даст бейдж Official
             let owner = if owner_trusted { a.owner.clone() } else { String::new() };
             let is_new_app = !reg.apps.contains_key(&a.id);
@@ -1121,6 +1166,8 @@ async fn announce(
                 funding: Vec::new(),
                 providers: HashMap::new(),
                 owner: owner.clone(),
+                logo: a.logo.clone(),
+                preview: a.preview.clone(),
             });
             // refresh metadata from the (verified) announcement
             if !a.name.is_empty() {
@@ -1138,6 +1185,13 @@ async fn announce(
             rec.merkle = a.merkle.clone();
             if !a.updated.is_empty() {
                 rec.updated = a.updated.clone();
+            }
+            // хэши медиа обновляются последним непустым анонсом (content-addressed)
+            if !a.logo.is_empty() {
+                rec.logo = a.logo.clone();
+            }
+            if !a.preview.is_empty() {
+                rec.preview = a.preview.clone();
             }
             if a.size > 0 {
                 rec.size_bytes = a.size;
@@ -1255,7 +1309,7 @@ async fn announce(
 }
 
 /// Auto-discovery: serve the DHT bootstrap addrs (ip:port) of SmartNet seeders
-/// that announced an open DHT server recently - so fresh clients don't need to
+/// that announced an open DHT server recently — so fresh clients don't need to
 /// add seeders manually (fully decentralized discovery). When an operator key is
 /// configured the list is ECDSA-signed (clients with the pubkey reject forgeries).
 #[derive(Serialize)]
@@ -1358,6 +1412,8 @@ fn app_to_out(rec: &AppRecord) -> AppOut {
         providers,
         owner: rec.owner.clone(),
         official: is_official(&rec.id, &rec.owner),
+        logo: rec.logo.clone(),
+        preview: rec.preview.clone(),
     }
 }
 
@@ -1410,7 +1466,7 @@ struct SeedStatOut {
     days: std::collections::BTreeMap<u64, u32>,
 }
 
-/// `GET /app/{id}/seeders` - посуточная статистика раздачи приложения по каждому
+/// `GET /app/{id}/seeders` — посуточная статистика раздачи приложения по каждому
 /// reward-адресу. Источник правды для per-app-выплат (payments-server).
 async fn app_seeders(
     State(state): State<AppState>,
@@ -1563,7 +1619,7 @@ struct StatsOut {
     #[serde(rename = "seedersOnline")]
     seeders_online: usize,
     /// Operator signing pubkey (secp256k1 compressed, hex). Empty when signing is
-    /// off. Lets clients auto-pin (TOFU) the key for /seeders-dht verification -
+    /// off. Lets clients auto-pin (TOFU) the key for /seeders-dht verification —
     /// old trackers simply omit it and clients stay in unsigned mode.
     #[serde(default)]
     pubkey: String,
@@ -1691,7 +1747,7 @@ async fn index() -> Html<&'static str> {
 
 async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
     state.prune();
-    // Seeder split (deduped by reward node) - computed before locking the app
+    // Seeder split (deduped by reward node) — computed before locking the app
     // registry to keep a single, consistent lock order.
     let (server_seeders, client_seeders, seeders_online) = {
         let s = state.seeders.lock().unwrap();
@@ -1771,7 +1827,7 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
 }
 
 // ============================================================
-//  Network Map - live seeder leaderboard (Byte-Hours ranking)
+//  Network Map — live seeder leaderboard (Byte-Hours ranking)
 // ============================================================
 
 /// JSON scraped from a seeder's /metrics endpoint.
@@ -1859,7 +1915,7 @@ async fn scrape_seeders(state: &AppState) {
     }
     let now = now_unix();
     state.seeders.lock().unwrap().retain(|_, e| {
-        // Client home-nodes (no /metrics) are pruned fast - 2 heartbeat slots -
+        // Client home-nodes (no /metrics) are pruned fast — 2 heartbeat slots —
         // so the map only ever shows currently-live clients. Headless servers
         // keep the 1h grace window (the /metrics scrape refreshes them).
         let ttl = if e.metrics_url.trim().is_empty() {
@@ -1997,7 +2053,7 @@ fn record_network_history(state: &AppState) {
     let mut hist = read_net_history(&state.db);
     if let Some(last) = hist.last() {
         if now.saturating_sub(last.t) < 1_500 {
-            return; // < ~25 min since last point - skip
+            return; // < ~25 min since last point — skip
         }
     }
     hist.push(NetPoint { t: now, used_gb: round2(used) });
@@ -2015,7 +2071,7 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// `GET /network/storage` - global cloud capacity meter for the dashboard.
+/// `GET /network/storage` — global cloud capacity meter for the dashboard.
 async fn network_storage(State(state): State<AppState>) -> Json<NetworkStorageStats> {
     let nodes = {
         let s = state.seeders.lock().unwrap();
@@ -2045,7 +2101,7 @@ async fn network_storage(State(state): State<AppState>) -> Json<NetworkStorageSt
 
 
 /// Public, self-contained Network Map dashboard served at `GET /map`. Fetches
-/// `/seeders` with JS and auto-refreshes - a leaderboard ranking every seeder
+/// `/seeders` with JS and auto-refreshes — a leaderboard ranking every seeder
 /// by their Byte-Hours contribution to incentivise hosting SmartNet dApps.
 const MAP_HTML: &str = r###"<!doctype html>
 <html lang="en">
@@ -2168,7 +2224,7 @@ fn compute_cost(base: u64, price_mb: u64, size_bytes: u64) -> u64 {
 }
 
 /// Parse a governance directive `sth_oracle:price_mb=<v>:base=<v>` (also tolerates
-/// the `price_mb==<v>` spelling). Returns `(base, price_per_mb)` - both required.
+/// the `price_mb==<v>` spelling). Returns `(base, price_per_mb)` — both required.
 fn parse_oracle_directive(field: &str) -> Option<(u64, u64)> {
     let tok = field.split_whitespace().find(|t| t.starts_with("sth_oracle:"))?;
     let body = tok.strip_prefix("sth_oracle:")?;
@@ -2246,7 +2302,7 @@ fn fetch_paid_amounts() -> HashMap<String, u64> {
                 .and_then(|s| s.parse().ok())
                 .or_else(|| t["amount"].as_u64())
                 .unwrap_or(0);
-            // `sth:<id>` (publish/update) - NOT `sth_boost:<id>`
+            // `sth:<id>` (publish/update) — NOT `sth_boost:<id>`
             if let Some(id) = t["vendorField"].as_str().and_then(|f| f.strip_prefix("sth:")) {
                 let id = id.trim();
                 if !id.is_empty() && amt > 0 {
@@ -2261,7 +2317,7 @@ fn fetch_paid_amounts() -> HashMap<String, u64> {
     amounts
 }
 
-/// Все платежи публикации/обновления (`sth:<id>`) на escrow с их txid - источник
+/// Все платежи публикации/обновления (`sth:<id>`) на escrow с их txid — источник
 /// funding-событий. В отличие от fetch_paid_amounts (только максимум) возвращает
 /// КАЖДУЮ транзакцию, чтобы каждое платное обновление (reseeding) стало отдельным
 /// банком на 5 дней. Дедуп по txid делается на стороне verify_payments.
@@ -2285,8 +2341,8 @@ fn fetch_funding_txs() -> HashMap<String, Vec<(String, u64, bool)>> {
                 .unwrap_or(0);
             let txid = t["id"].as_str().unwrap_or("").trim().to_string();
             let field = t["vendorField"].as_str().unwrap_or("");
-            // publish/update (`sth:<id>`) - банк, требующий порога цены;
-            // boost (`sth_boost:<id>`) - банк без порога (доп. награда сидерам).
+            // publish/update (`sth:<id>`) — банк, требующий порога цены;
+            // boost (`sth_boost:<id>`) — банк без порога (доп. награда сидерам).
             let (id_opt, is_boost) = if let Some(id) = field.strip_prefix("sth_boost:") {
                 (Some(id), true)
             } else if let Some(id) = field.strip_prefix("sth:") {
@@ -2338,7 +2394,7 @@ fn fetch_boost_pools() -> HashMap<String, u64> {
 /// One verification pass: recompute the paid flag + boost pool + priority weight
 /// for every known app. An app is PAID when an `sth:<id>` payment landed on
 /// escrow with amount >= its DYNAMIC cost (base + round(MB)·price_mb) computed
-/// from the announced payload weight. Blocking (ureq) - call via spawn_blocking.
+/// from the announced payload weight. Blocking (ureq) — call via spawn_blocking.
 fn verify_payments(state: &AppState) {
     let (base, price_mb) = fetch_oracle_params(&state.db);
     let amounts = fetch_paid_amounts();
@@ -2353,8 +2409,8 @@ fn verify_payments(state: &AppState) {
             let min_smarthoshi = min_sth.saturating_mul(SMARTHOSHI);
             let mut touched = false;
 
-            // Phase G: добавляем НОВЫЕ funding-события (каждое платное обновление -
-            // отдельный банк на 5 дней). Дедуп по txid; порог - динамическая цена.
+            // Phase G: добавляем НОВЫЕ funding-события (каждое платное обновление —
+            // отдельный банк на 5 дней). Дедуп по txid; порог — динамическая цена.
             if let Some(list) = funding_txs.get(id) {
                 let known: std::collections::HashSet<String> =
                     rec.funding.iter().map(|f| f.txid.clone()).collect();
@@ -2434,7 +2490,7 @@ fn verify_payments(state: &AppState) {
 async fn main() {
     // Подхватываем настройки из `.env` (если файл рядом с бинарником или в текущей
     // директории). Даёт удобство хостинга на VPS: одна правка `.env` вместо экспорта
-    // переменных вручную. Ошибка отсутствия файла игнорируется - env-переменные
+    // переменных вручную. Ошибка отсутствия файла игнорируется — env-переменные
     // всё ещё можно задать через shell/systemd EnvironmentFile.
     let _ = dotenvy::dotenv();
 
@@ -2514,7 +2570,7 @@ async fn main() {
     };
     if state.operator_sk.is_some() {
         let pk = PublicKey::from_secret_key(&Secp256k1::new(), state.operator_sk.as_ref().unwrap());
-        tracing::info!("operator signing ENABLED - /seeders-dht pubkey: {}", hex::encode(pk.serialize()));
+        tracing::info!("operator signing ENABLED — /seeders-dht pubkey: {}", hex::encode(pk.serialize()));
     }
 
     // background pruner so stale providers don't linger between requests
@@ -2604,7 +2660,7 @@ async fn main() {
     tracing::info!("SmartNet tracker listening on {} (ttl {}s)", addr, ttl_secs);
     tracing::info!(
         "incentivized seeding: {} (toggle with ENABLE_INCENTIVIZED_SEEDING)",
-        if incentivized { "ON" } else { "OFF - exposing ALL apps (emergency mode)" }
+        if incentivized { "ON" } else { "OFF — exposing ALL apps (emergency mode)" }
     );
     tracing::info!(
         "announce logging: {} (toggle with SMARTNET_TRACKER_LOG_ANNOUNCE)",
@@ -2641,11 +2697,14 @@ mod tests {
             tags: vec!["demo".into()],
             merkle: merkle.into(),
             version: 1,
+            updated: String::new(),
             hash: "h".into(),
             size: 0,
             signature,
             public_key: hex::encode(pk.serialize()),
             owner: String::new(),
+            logo: String::new(),
+            preview: String::new(),
         }
     }
 
@@ -2665,11 +2724,14 @@ mod tests {
             tags: vec!["demo".into()],
             merkle: merkle.into(),
             version: 1,
+            updated: String::new(),
             hash: "h".into(),
             size: 0,
             signature,
             public_key: hex::encode(pk.serialize()),
             owner: owner.into(),
+            logo: String::new(),
+            preview: String::new(),
         }
     }
 
