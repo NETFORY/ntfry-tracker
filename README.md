@@ -1,4 +1,4 @@
-![ntfry-tracker.jpg](ntfry-tracker.jpg)
+![SmartNet-Tracker.jpg](SmartNet-Tracker.jpg)
 # SmartNet Tracker
 
 A lightweight, standalone Rust (axum) **bootstrap directory** for WAN dApp
@@ -6,7 +6,7 @@ discovery. It lets SmartNet nodes find each other over the internet when LAN
 mDNS is not enough.
 
 The tracker is **stateless on disk**: it keeps only an in-memory registry of
-*signed* app announcements with a TTL heartbeat. It **never stores blobs** —
+*signed* app announcements with a TTL heartbeat. It **never stores blobs**
 the actual dApp content still moves peer-to-peer over `iroh-blobs`.
 
 ## Trust model
@@ -37,29 +37,28 @@ SMARTNET_TRACKER_LOG_ANNOUNCE=1 \
   ./target/release/ntfry-tracker
 ```
 
-- `SMARTNET_TRACKER_LOG_ANNOUNCE` — log every accepted (`INFO`) / rejected
+- `SMARTNET_TRACKER_LOG_ANNOUNCE` log every accepted (`INFO`) / rejected
   (`WARN`) announce. **On by default**; disable with `0` (also `false`/`off`/`no`).
   Stats counters in `/stats` keep counting even when logging is off.
 
 The client ships these public seed trackers by default (configurable in
-**Settings → P2P → WAN TRACKERS**):
+**Settings -> P2P -> WAN TRACKERS**):
 
 ```
 http://159.69.188.60:7374
-http://91.99.119.119:7374
 ```
 
 ## API
 
-| Method | Path          | Purpose                                              |
-| ------ | ------------- | ---------------------------------------------------- |
-| GET    | `/`           | HTML status dashboard (auto-refreshes `/stats`) — open in a browser |
-| POST   | `/announce`   | Heartbeat: register/refresh the apps a node serves   |
-| GET    | `/apps`       | All known apps (deduped) with seed counts + providers|
-| GET    | `/app/:id`    | Providers for a single app id                        |
-| GET    | `/seeds`      | Distinct live nodes (endpoints) seen recently        |
-| GET    | `/stats`      | Aggregate stats: live apps/providers/endpoints, lifetime accept/reject totals, top-10 apps by seeds |
-| GET    | `/health`     | Liveness + registry stats                            |
+| Method | Path        | Purpose                                                                                             |
+|--------|-------------|-----------------------------------------------------------------------------------------------------|
+| GET    | `/`         | HTML status dashboard (auto-refreshes `/stats`) open in a browser                                   |
+| POST   | `/announce` | Heartbeat: register/refresh the apps a node serves                                                  |
+| GET    | `/apps`     | All known apps (deduped) with seed counts + providers                                               |
+| GET    | `/app/:id`  | Providers for a single app id                                                                       |
+| GET    | `/seeds`    | Distinct live nodes (endpoints) seen recently                                                       |
+| GET    | `/stats`    | Aggregate stats: live apps/providers/endpoints, lifetime accept/reject totals, top-10 apps by seeds |
+| GET    | `/health`   | Liveness + registry stats                                                                           |
 
 ### POST /announce
 
@@ -86,7 +85,7 @@ Response: `{ "ok": true, "accepted": N, "rejected": M, "ttlSecs": 120 }`.
 
 ```bash
 cargo test                          # crypto verify unit tests
-cargo run --example gen_announce          # print a VALID announce  → accepted
-cargo run --example gen_announce tamper   # mutated after signing    → rejected
-cargo run --example gen_announce badid    # id != pubkey address     → rejected
+cargo run --example gen_announce          # print a VALID announce  -> accepted
+cargo run --example gen_announce tamper   # mutated after signing    -> rejected
+cargo run --example gen_announce badid    # id != pubkey address     -> rejected
 ```
