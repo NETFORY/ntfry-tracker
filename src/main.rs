@@ -43,9 +43,62 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::{Any, CorsLayer};
 
+mod ai_pool;
+mod diag;
+mod sth_hints;
+
+/// Захват мьютекса, устойчивый к «отравлению» (v1.7.2).
+///
+/// Раньше везде стоял `lock().unwrap()`: ОДНА паника внутри критической секции
+/// отравляла мьютекс, и дальше КАЖДЫЙ запрос к этим данным паниковал — трекер
+/// навсегда оставался живым процессом, который ничего не отдаёт. Данные под
+/// локом у нас самовосстанавливающиеся (TTL-реестр, пул сидеров), поэтому
+/// продолжаем работу с ними вместо смерти сервиса.
+pub(crate) fn lk<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| {
+        tracing::warn!("mutex был отравлён паникой — продолжаем с восстановленными данными");
+        e.into_inner()
+    })
+}
+
+/// Общий HTTP-агент для блокирующих запросов к блокчейн-нодам и /metrics сидеров.
+/// Явные таймауты connect/read/write + общий дедлайн: ни один опрос внешнего
+/// узла не может «повиснуть» в blocking-пуле навсегда.
+fn http_agent() -> ureq::Agent {
+    static A: OnceLock<ureq::Agent> = OnceLock::new();
+    A.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(10))
+            .timeout_write(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+    })
+    .clone()
+}
+
 const VERSION_BYTE: u8 = 0x3f; // SmartHoldem network pubKeyHash 63
 const DEFAULT_PORT: u16 = 7374;
 const DEFAULT_TTL_SECS: u64 = 120;
+/// Счётчики для сводки анонсов (раз в 5 мин в журнал вместо строки на каждый dApp каждые 30 с).
+static ANNOUNCE_REFRESHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ANNOUNCE_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ANNOUNCE_NODES: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+const ANNOUNCE_SUMMARY_SECS: u64 = 300;
+
+fn spawn_announce_summary() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(ANNOUNCE_SUMMARY_SECS)).await;
+            let hb = ANNOUNCE_HEARTBEATS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let rf = ANNOUNCE_REFRESHES.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let nodes = std::mem::take(&mut *ANNOUNCE_NODES.lock().unwrap()).len();
+            if hb > 0 {
+                tracing::info!("announce summary (last {} min): {hb} heartbeats from {nodes} nodes, {rf} dApp refreshes", ANNOUNCE_SUMMARY_SECS / 60);
+            }
+        }
+    });
+}
 
 // ---- Anti-spam payment verification (Phase B) ----
 /// Public SmartHoldem node REST base.
@@ -249,6 +302,19 @@ struct Health {
     #[serde(rename = "ttlSecs")]
     ttl_secs: u64,
     uptime: u64,
+    /// реестр занят другой операцией — счётчики apps/providers не отданы
+    #[serde(rename = "regBusy")]
+    reg_busy: bool,
+    /// возраст heartbeat async-задачи, с (растёт = залип рантайм)
+    #[serde(rename = "heartbeatAge")]
+    heartbeat_age: u64,
+    /// открытых файловых дескрипторов (утечка = порт перестанет принимать)
+    #[serde(rename = "openFds")]
+    open_fds: usize,
+    #[serde(rename = "rssMb")]
+    rss_mb: u64,
+    /// сколько паник поймано с запуска
+    panics: u64,
 }
 
 // ============================================================
@@ -325,7 +391,10 @@ struct AppRecord {
 /// 5 дней. Наложение окон безопасно: каждый банк делится строго на 5 дней.
 #[derive(Clone, Serialize, Deserialize)]
 struct FundingEvent {
-    /// unix-время, когда трекер ВПЕРВЫЕ увидел эту транзакцию (окно считается отсюда).
+    /// unix-время транзакции В БЛОКЧЕЙНЕ (`timestamp.unix`) — окно 5 дней
+    /// считается отсюда. Раньше здесь было время первого обнаружения трекером:
+    /// после рестарта/очистки БД или по истечении FUNDING_RETAIN старые платежи
+    /// «переоткрывались» и получали свежее 5-дневное окно (вечно PAID).
     ts: u64,
     /// сумма банка события в smarthoshi.
     #[serde(rename = "amount")]
@@ -333,6 +402,9 @@ struct FundingEvent {
     /// on-chain id транзакции — ключ дедупликации (одна tx = одно событие).
     #[serde(default)]
     txid: String,
+    /// true = буст сидинга (`sth_boost:<id>`), false = публикация/обновление (`sth:<id>`).
+    #[serde(default)]
+    boost: bool,
 }
 
 struct Registry {
@@ -361,7 +433,17 @@ struct SeederEntry {
     /// This seeder's public DHT bootstrap addr (ip:port), advertised in /announce
     /// and served via GET /seeders-dht for client auto-discovery.
     dht_addr: String,
+    /// last signed heartbeat (POST /seeder/heartbeat) for this reward address —
+    /// liveness fallback when the headless /metrics endpoint is unreachable.
+    last_hb: u64,
 }
+
+/// Через сколько считаем /metrics headless-сидера недоступными (3 неудачных
+/// цикла скрейпа по 60 с + запас).
+const SCRAPE_STALE_SECS: u64 = 15 * 60;
+/// Без announce дольше этого headless-сидер считается выключенным (announce идёт
+/// каждые ~TTL=120 с).
+const HEADLESS_ANNOUNCE_GRACE_SECS: u64 = 10 * 60;
 
 /// Lifetime counters (since process start).
 #[derive(Default)]
@@ -396,6 +478,298 @@ struct AppState {
     /// GET /seeders-dht responses are ECDSA-signed so clients with the matching
     /// pubkey can reject poisoned/MITM'd seeder lists.
     operator_sk: Option<SecretKey>,
+    /// Netfory AI Pool: активные opt-in AI-ноды (in-memory, TTL 45s).
+    ai_pool: ai_pool::AiPoolMap,
+    /// PQ Web egress nodes (v1.6.6): operator-curated list from env
+    /// `PQWEB_NODES="<EndpointId>@NL,<EndpointId>@FI"`, served signed via GET /pqweb.
+    /// v1.6.7: when non-empty it is also the ALLOWLIST for self-announcing nodes.
+    pqweb_nodes: Arc<Vec<PqWebNode>>,
+    /// v1.6.7: self-announced pq-web nodes (POST /pqweb/announce, ed25519-signed by
+    /// the node's own iroh key): id -> entry. TTL PQWEB_TTL_SECS, pruned on read.
+    pqweb_live: Arc<Mutex<HashMap<String, PqWebLive>>>,
+    /// v1.8.0: адресные подсказки sth-core P2P-узлов от клиентов (POST /sth/hint).
+    sth_hints: sth_hints::SthHintMap,
+    /// v1.9.0: живой пул sth-core провайдеров (самоанонс).
+    sth_pool: sth_hints::SthPoolMap,
+}
+
+// ---------------------------------------------------------------------------
+//  PQ Web nodes (v1.6.6) — signed list of pq-web egress nodes for the client
+// ---------------------------------------------------------------------------
+#[derive(Clone, Serialize)]
+struct PqWebNode {
+    /// iroh EndpointId of the pq-web node (hex, as printed by `pq-web id`).
+    id: String,
+    /// Region label (NL, FI, DE …), may be empty.
+    region: String,
+    /// v1.6.7: node is in the operator allowlist (env PQWEB_NODES).
+    #[serde(default)]
+    verified: bool,
+    /// v1.6.7: pq-web version from the node's heartbeat ("" for env-only entries).
+    #[serde(default)]
+    ver: String,
+    /// v1.6.7: unix ts of the last heartbeat (0 for env-only entries).
+    #[serde(default, rename = "lastSeen")]
+    last_seen: u64,
+    /// v1.6.8: public ip:port of the node (signed in the heartbeat) — clients dial directly.
+    #[serde(default)]
+    addrs: Vec<String>,
+    /// v1.6.8: node's home relay URL.
+    #[serde(default)]
+    relay: String,
+    /// v1.6.9: node accepts any https host (`pq-web serve --open`) — usable for dVPN "total" mode.
+    #[serde(default)]
+    open: bool,
+    /// v1.7.1: node egresses to sites over IPv6 (pq-web ≥ 0.4.0, signed in the v4 canon).
+    #[serde(default)]
+    ipv6: bool,
+    /// v1.9.1: node relays NETFORY Mycelium mushroom circuits (pq-web ≥ 0.6.0 `--mycelium`, v5 canon).
+    #[serde(default)]
+    mycelium: bool,
+}
+
+#[derive(Serialize)]
+struct PqWebResp {
+    nodes: Vec<PqWebNode>,
+    /// Unix time the response was signed (anti-replay hint for clients).
+    ts: u64,
+    /// secp256k1 ECDSA (compact, hex) over
+    /// sha256(["pqweb", ts, "<id>@<region>"…].join("\n")). Empty = unsigned.
+    sig: String,
+}
+
+/// Self-announced pq-web node (v1.6.7).
+#[derive(Clone)]
+struct PqWebLive {
+    region: String,
+    ver: String,
+    last_seen: u64,
+    addrs: Vec<String>,
+    relay: String,
+    open: bool,
+    ipv6: bool,
+    mycelium: bool,
+}
+
+/// Heartbeat TTL: a node that stops announcing disappears from GET /pqweb.
+const PQWEB_TTL_SECS: u64 = 180;
+/// Anti-replay window for the signed heartbeat timestamp.
+const PQWEB_TS_SKEW_SECS: u64 = 300;
+/// Memory cap for self-announced nodes.
+const PQWEB_MAX_LIVE: usize = 500;
+
+/// `POST /pqweb/announce` body. `sig` = ed25519 (hex, 64 bytes) by the node's iroh
+/// secret key over `pqweb-announce|<id>|<region>|<ver>|<ts>`; `id` = hex pubkey.
+#[derive(Deserialize)]
+struct PqWebAnnounce {
+    id: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    ver: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ports: Vec<u16>,
+    /// v1.6.8: public ip:port list (max 6), part of the signed canon.
+    #[serde(default)]
+    addrs: Vec<String>,
+    /// v1.6.8: home relay URL, part of the signed canon.
+    #[serde(default)]
+    relay: String,
+    /// v1.6.9: `--open` node (any host), part of the v3 canon.
+    #[serde(default)]
+    open: bool,
+    /// v1.7.1: IPv6 egress flag (pq-web ≥ 0.4.0), part of the v4 canon.
+    #[serde(default)]
+    ipv6: bool,
+    /// v1.9.1: Mycelium relay flag (pq-web ≥ 0.6.0), part of the v5 canon.
+    #[serde(default)]
+    mycelium: bool,
+    ts: u64,
+    sig: String,
+}
+
+/// v4 canon (pq-web ≥ 0.4.0): addrs + relay + open + ipv6 are signed.
+/// v5 (pq-web ≥ 0.6.0, `--mycelium`): the same line with a `|1` tail; nodes without Mycelium
+/// keep signing v4, so the flag can only be set by a node that actually signs it.
+#[allow(clippy::too_many_arguments)]
+fn pqweb_announce_canon(id: &str, region: &str, ver: &str, ts: u64, addrs: &[String], relay: &str, open: bool, ipv6: bool, mycelium: bool) -> String {
+    let v4 = format!("pqweb-announce|{id}|{region}|{ver}|{ts}|{}|{relay}|{}|{}", addrs.join(","), if open { 1 } else { 0 }, if ipv6 { 1 } else { 0 });
+    if mycelium {
+        format!("{v4}|1")
+    } else {
+        v4
+    }
+}
+
+/// Verify the node's ed25519 signature: id must be the hex pubkey (64 chars).
+fn pqweb_verify(a: &PqWebAnnounce) -> Result<(), &'static str> {
+    let pk_bytes = hex::decode(a.id.trim()).map_err(|_| "bad-id-hex")?;
+    let pk_arr: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| "bad-id-len")?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk_arr).map_err(|_| "bad-pubkey")?;
+    let sig_bytes = hex::decode(a.sig.trim()).map_err(|_| "bad-sig-hex")?;
+    let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| "bad-sig-len")?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    let canon = pqweb_announce_canon(a.id.trim(), a.region.trim(), a.ver.trim(), a.ts, &a.addrs, a.relay.trim(), a.open, a.ipv6, a.mycelium);
+    if vk.verify_strict(canon.as_bytes(), &sig).is_ok() {
+        return Ok(());
+    }
+    // старые каноны — только без флага mycelium (его подписывает лишь pq-web ≥ 0.6.0)
+    if a.mycelium {
+        return Err("bad-signature");
+    }
+    // v3 canon (pq-web 0.3.x, без ipv6) — принимаем, если ipv6=false
+    if !a.ipv6 {
+        let v3 = format!("pqweb-announce|{}|{}|{}|{}|{}|{}|{}", a.id.trim(), a.region.trim(), a.ver.trim(), a.ts, a.addrs.join(","), a.relay.trim(), if a.open { 1 } else { 0 });
+        if vk.verify_strict(v3.as_bytes(), &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    // v2 canon (pq-web 0.2.x, без open) — принимаем, если open=false
+    if !a.open && !a.ipv6 {
+        let v2 = format!("pqweb-announce|{}|{}|{}|{}|{}|{}", a.id.trim(), a.region.trim(), a.ver.trim(), a.ts, a.addrs.join(","), a.relay.trim());
+        if vk.verify_strict(v2.as_bytes(), &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    // v1 canon (pq-web 0.2.0, без addrs/relay) — принимаем, если addrs/relay пустые
+    if a.addrs.is_empty() && a.relay.trim().is_empty() && !a.open && !a.ipv6 {
+        let v1 = format!("pqweb-announce|{}|{}|{}|{}", a.id.trim(), a.region.trim(), a.ver.trim(), a.ts);
+        if vk.verify_strict(v1.as_bytes(), &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("bad-signature")
+}
+
+/// POST /pqweb/announce — pq-web node heartbeat (v1.6.7). Trust policy (c):
+/// when the operator allowlist (env PQWEB_NODES) is non-empty only listed ids are
+/// accepted; when it is empty registration is open (nodes are served `verified:false`).
+async fn pqweb_announce(State(state): State<AppState>, Json(a): Json<PqWebAnnounce>) -> (StatusCode, Json<serde_json::Value>) {
+    let id = a.id.trim().to_ascii_lowercase();
+    let now = now_unix();
+    if a.ts + PQWEB_TS_SKEW_SECS < now || a.ts > now + PQWEB_TS_SKEW_SECS {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "error": "stale-ts", "now": now })));
+    }
+    if let Err(e) = pqweb_verify(&a) {
+        tracing::warn!("pqweb announce REJECTED id={} ({})", id, e);
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "ok": false, "error": e })));
+    }
+    let allow = state.pqweb_nodes.iter().find(|n| n.id.eq_ignore_ascii_case(&id));
+    if !state.pqweb_nodes.is_empty() && allow.is_none() {
+        tracing::warn!("pqweb announce REJECTED id={} (not in PQWEB_NODES allowlist)", id);
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({ "ok": false, "error": "not-allowed" })));
+    }
+    let region = {
+        let r = a.region.trim().to_ascii_uppercase();
+        if r.is_empty() { allow.map(|n| n.region.clone()).unwrap_or_default() } else { r.chars().take(8).collect() }
+    };
+    let ver: String = a.ver.trim().chars().take(24).collect();
+    let mut live = lk(&state.pqweb_live);
+    live.retain(|_, e| e.last_seen + PQWEB_TTL_SECS > now);
+    let is_new = !live.contains_key(&id);
+    if is_new && live.len() >= PQWEB_MAX_LIVE {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "ok": false, "error": "full" })));
+    }
+    let addrs: Vec<String> = a.addrs.iter().filter(|x| x.parse::<std::net::SocketAddr>().is_ok()).take(6).cloned().collect();
+    let relay: String = a.relay.trim().chars().take(128).collect();
+    let e = live.entry(id.clone()).or_insert(PqWebLive { region: region.clone(), ver: ver.clone(), last_seen: now, addrs: Vec::new(), relay: String::new(), open: false, ipv6: false, mycelium: false });
+    e.region = region;
+    e.ver = ver;
+    e.last_seen = now;
+    e.addrs = addrs;
+    e.relay = relay;
+    e.open = a.open;
+    e.ipv6 = a.ipv6;
+    e.mycelium = a.mycelium;
+    if is_new {
+        tracing::info!("pqweb node ONLINE id={} region={} ver={} open={} ipv6={} mycelium={} verified={}", id, e.region, e.ver, e.open, e.ipv6, e.mycelium, allow.is_some());
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "verified": allow.is_some(), "ttlSecs": PQWEB_TTL_SECS, "now": now })))
+}
+
+/// Fresh self-announced nodes (pruned) + count for /stats.
+fn pqweb_live_nodes(state: &AppState) -> Vec<PqWebNode> {
+    let now = now_unix();
+    let mut live = lk(&state.pqweb_live);
+    live.retain(|_, e| e.last_seen + PQWEB_TTL_SECS > now);
+    live.iter()
+        .map(|(id, e)| PqWebNode {
+            id: id.clone(),
+            region: e.region.clone(),
+            verified: state.pqweb_nodes.iter().any(|n| n.id.eq_ignore_ascii_case(id)),
+            ver: e.ver.clone(),
+            last_seen: e.last_seen,
+            addrs: e.addrs.clone(),
+            relay: e.relay.clone(),
+            open: e.open,
+            ipv6: e.ipv6,
+            mycelium: e.mycelium,
+        })
+        .collect()
+}
+
+/// `PQWEB_NODES` parser: comma/whitespace separated `<id>[@region]` entries.
+fn parse_pqweb_nodes(raw: &str) -> Vec<PqWebNode> {
+    let mut out: Vec<PqWebNode> = Vec::new();
+    for tok in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (id, region) = match tok.split_once('@') {
+            Some((i, r)) => (i.trim(), r.trim()),
+            None => (tok, ""),
+        };
+        // EndpointId = 32 bytes: 64 hex chars or 52 z-base32 chars
+        let looks_ok = (id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+            || (id.len() == 52 && id.chars().all(|c| c.is_ascii_alphanumeric()));
+        if !looks_ok || out.iter().any(|n| n.id == id) {
+            tracing::warn!("PQWEB_NODES: skipping invalid/duplicate entry {:?}", tok);
+            continue;
+        }
+        out.push(PqWebNode { id: id.to_ascii_lowercase(), region: region.to_ascii_uppercase(), verified: true, ver: String::new(), last_seen: 0, addrs: Vec::new(), relay: String::new(), open: false, ipv6: false, mycelium: false });
+    }
+    out
+}
+
+/// Canonical signing lines shared with the client (`webproxy.rs`).
+fn pqweb_canon(ts: u64, nodes: &[PqWebNode]) -> Vec<String> {
+    let mut lines = vec!["pqweb".to_string(), ts.to_string()];
+    lines.extend(nodes.iter().map(|n| format!("{}@{}", n.id, n.region)));
+    lines
+}
+
+/// GET /pqweb — operator-curated pq-web node list, ECDSA-signed when
+/// OPERATOR_SECRET is set (same key/pubkey as /seeders-dht).
+async fn pqweb_nodes(State(state): State<AppState>) -> Json<PqWebResp> {
+    // env (verified, static) first; then live heartbeats not already listed, sorted by id
+    let mut nodes: Vec<PqWebNode> = state.pqweb_nodes.iter().cloned().collect();
+    let mut live = pqweb_live_nodes(&state);
+    live.sort_by(|a, b| a.id.cmp(&b.id));
+    for l in live {
+        if let Some(n) = nodes.iter_mut().find(|n| n.id.eq_ignore_ascii_case(&l.id)) {
+            n.ver = l.ver;
+            n.last_seen = l.last_seen;
+            n.addrs = l.addrs;
+            n.relay = l.relay;
+            n.open = l.open;
+            n.ipv6 = l.ipv6;
+            n.mycelium = l.mycelium;
+        } else {
+            nodes.push(l);
+        }
+    }
+    let ts = now_unix();
+    let sig = match &state.operator_sk {
+        Some(sk) => {
+            let digest = sha256(pqweb_canon(ts, &nodes).join("\n").as_bytes());
+            let msg = Message::from_digest_slice(&digest).unwrap();
+            hex::encode(Secp256k1::signing_only().sign_ecdsa(&msg, sk).serialize_compact())
+        }
+        None => String::new(),
+    };
+    Json(PqWebResp { nodes, ts, sig })
 }
 
 /// Caps for the anti-censorship DHT pool (anti-spam / memory bound).
@@ -406,27 +780,30 @@ const DHT_SERVE_MAX: usize = 32;
 const DHT_POOL_TTL_SECS: u64 = 3600;
 
 impl AppState {
+    /// v1.7.2: чистка строго in-memory. Раньше под удержанием мьютекса реестра
+    /// выполнялись `db.remove` и `db.flush()` (fsync) — на каждом запросе к
+    /// /health, /apps, /seeds. Один долгий fsync блокировал ВСЕ обработчики, и
+    /// трекер выглядел зависшим. Теперь диск не трогается в request-path:
+    /// удаление идёт после снятия лока, а flush делает фоновая задача.
     fn prune(&self) {
         let now = Instant::now();
-        let mut reg = self.reg.lock().unwrap();
         let mut emptied: Vec<String> = Vec::new();
-        for rec in reg.apps.values_mut() {
-            rec.providers.retain(|_, p| p.expires > now);
-        }
-        reg.apps.retain(|id, r| {
-            if r.providers.is_empty() {
-                emptied.push(id.clone());
-                false
-            } else {
-                true
+        {
+            let mut reg = lk(&self.reg);
+            for rec in reg.apps.values_mut() {
+                rec.providers.retain(|_, p| p.expires > now);
             }
-        });
-        // drop emptied apps from persistent storage too
+            reg.apps.retain(|id, r| {
+                if r.providers.is_empty() {
+                    emptied.push(id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         for id in emptied {
             let _ = self.db.remove(id.as_bytes());
-        }
-        if !reg.apps.is_empty() {
-            let _ = self.db.flush();
         }
     }
 
@@ -601,7 +978,7 @@ fn official_sets() -> &'static Mutex<(HashSet<String>, HashSet<String>)> {
 /// App is official when its manifest owner is a trusted developer OR the
 /// appId itself was explicitly approved on-chain.
 fn is_official(id: &str, owner: &str) -> bool {
-    let g = official_sets().lock().unwrap();
+    let g = lk(official_sets());
     g.1.contains(id) || (!owner.is_empty() && g.0.contains(owner))
 }
 
@@ -642,7 +1019,7 @@ fn official_scan_registry(recipient: &str) -> Result<Vec<String>, String> {
                 "https://{}/api/transactions?recipientId={}&senderId={}&page={}&limit=100&orderBy=timestamp:desc",
                 host, recipient, ORACLE_SENDER, page
             );
-            let resp = match ureq::get(&url).timeout(Duration::from_secs(12)).call() {
+            let resp = match http_agent().get(&url).call() {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = e.to_string();
@@ -728,7 +1105,7 @@ fn official_refresh(state: &AppState) -> Result<(), String> {
         dev_set.len(),
         dapp_set.len()
     );
-    *official_sets().lock().unwrap() = (dev_set, dapp_set);
+    *lk(official_sets()) = (dev_set, dapp_set);
     Ok(())
 }
 
@@ -746,7 +1123,7 @@ fn official_load(state: &AppState) {
     let mut devs = read(b"official:devs");
     devs.extend(official_env_devs());
     let dapps = read(b"official:dapps");
-    *official_sets().lock().unwrap() = (devs, dapps);
+    *lk(official_sets()) = (devs, dapps);
 }
 
 fn now_unix() -> u64 {
@@ -1007,17 +1384,59 @@ async fn seeder_heartbeat(
     {
         let active_slots = bits_set_count(&win.bits) as u64;
         let uptime_secs = active_slots * HB_SLOT_SECS;
-        let mut map = state.seeders.lock().unwrap();
+        let mut map = lk(&state.seeders);
         // Don't shadow a headless seeder that already advertises /metrics for the
         // same reward address — just refresh its liveness instead of adding a dup.
+        // НО только если его /metrics реально скрейпится: если headless-запись
+        // мёртвая (метрики недоступны > SCRAPE_STALE_SECS — сидер выключен или порт
+        // закрыт), heartbeat не должен вечно продлевать ей жизнь и держать адрес
+        // «не в сети» с 0 ГБ. Тогда запись снимаем и ведём адрес как клиента.
         let headless_key = map
             .iter()
             .find(|(_, e)| e.node == hb.reward_address && !e.metrics_url.trim().is_empty())
             .map(|(k, _)| k.clone());
-        if let Some(k) = headless_key {
-            if let Some(e) = map.get_mut(&k) {
-                e.last_seen = now;
+        // Состояние headless-записи того же адреса:
+        //   alive     — /metrics скрейпятся (свежий last_scraped) → просто продлеваем;
+        //   announced — процесс сидера жив (announce идёт), но /metrics недоступны
+        //               (закрыт порт/NAT) → заполняем статы из heartbeat, online=true;
+        //   dead      — announce давно не было (сидер выключен) → запись снимаем,
+        //               адрес ведём как клиента. Иначе адрес вечно «не в сети», 0 ГБ.
+        let (headless_alive, headless_announced) = headless_key
+            .as_ref()
+            .and_then(|k| map.get(k))
+            .map(|e| {
+                (
+                    e.last_scraped > 0 && now.saturating_sub(e.last_scraped) < SCRAPE_STALE_SECS,
+                    now.saturating_sub(e.last_seen) < HEADLESS_ANNOUNCE_GRACE_SECS,
+                )
+            })
+            .unwrap_or((false, false));
+        if let (Some(k), false, false) = (&headless_key, headless_alive, headless_announced) {
+            tracing::info!(
+                "seeder {}: headless entry stale (no announce, /metrics unreachable) — dropping, tracking as client via heartbeat",
+                hb.reward_address
+            );
+            map.remove(k);
+        }
+        if headless_alive || headless_announced {
+            // last_seen НЕ трогаем: его продлевает только announce самого сидера —
+            // иначе heartbeat UI держал бы выключенный headless «живым» вечно.
+            if let Some(e) = headless_key.as_ref().and_then(|k| map.get_mut(k)) {
+                e.last_hb = now;
                 e.online = true;
+                if !headless_alive {
+                    // метрики недоступны — статы из подписанного heartbeat'а
+                    e.uptime_secs = uptime_secs;
+                    if hb.seeded_gb > 0.0 {
+                        e.gb_seeded = hb.seeded_gb;
+                    }
+                    if hb.storage_limit_gb > 0.0 {
+                        e.storage_limit_gb = hb.storage_limit_gb;
+                    }
+                    if hb.byte_hours > 0.0 {
+                        e.score = hb.byte_hours;
+                    }
+                }
             }
         } else {
             let e = map
@@ -1036,8 +1455,10 @@ async fn seeder_heartbeat(
                     online: true,
                     last_scraped: 0,
                     dht_addr: String::new(),
+                    last_hb: 0,
                 });
             e.last_seen = now;
+            e.last_hb = now;
             e.online = true;
             e.apps = hb.active_app_ids.len();
             e.uptime_secs = uptime_secs;
@@ -1113,18 +1534,20 @@ async fn announce(
     let expires = Instant::now() + state.ttl;
     let mut accepted = 0usize;
     let mut rejected = 0usize;
+    ANNOUNCE_HEARTBEATS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ANNOUNCE_NODES.lock().unwrap().insert(req.endpoint_id.clone());
 
     // Snapshot of currently-tombstoned ids — owner-deleted apps must NOT be
     // re-created by other seeders' announces while the tombstone is live.
     let tombstoned: std::collections::HashSet<String> = {
         let now = now_unix();
-        let mut t = state.tombstones.lock().unwrap();
+        let mut t = lk(&state.tombstones);
         t.retain(|_, ts| *ts + TOMBSTONE_TTL_SECS > now);
         t.keys().cloned().collect()
     };
 
     {
-        let mut reg = state.reg.lock().unwrap();
+        let mut reg = lk(&state.reg);
         let mut touched: Vec<String> = Vec::new();
         for a in &req.apps {
             if tombstoned.contains(&a.id) {
@@ -1213,14 +1636,13 @@ async fn announce(
             );
             accepted += 1;
             touched.push(a.id.clone());
-            if state.log_announce {
-                let kind = if is_new_app {
-                    "NEW"
-                } else if is_new_provider {
-                    "+seed"
-                } else {
-                    "refresh"
-                };
+            // v1.9.2: «refresh» (каждые 30–60 с от каждого узла по каждому dApp) — только в счётчик сводки;
+            // в журнал INFO идут лишь новые dApp'ы и новые сидеры
+            if !is_new_app && !is_new_provider {
+                ANNOUNCE_REFRESHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if state.log_announce && (is_new_app || is_new_provider) {
+                let kind = if is_new_app { "NEW" } else { "+seed" };
                 tracing::info!(
                     "announce {} app={} name={:?} v{} node={} endpoint={} hash={}",
                     kind,
@@ -1234,12 +1656,13 @@ async fn announce(
             }
         }
         // persist the touched records so the directory survives restarts
+        // (без flush: fsync под мьютексом реестра подвешивал весь трекер —
+        //  сброс на диск делает фоновая задача каждые 30 с, v1.7.2)
         for id in touched {
             if let Some(rec) = reg.apps.get(&id) {
                 state.persist(rec);
             }
         }
-        let _ = state.db.flush();
     }
 
     state.stats.announce_requests.fetch_add(1, Ordering::Relaxed);
@@ -1251,7 +1674,7 @@ async fn announce(
     // flooding the pool and rejects anything that isn't a real socket addr.
     if !req.dht.is_empty() {
         let now = now_unix();
-        let mut pool = state.dht_pool.lock().unwrap();
+        let mut pool = lk(&state.dht_pool);
         for raw in req.dht.iter().take(DHT_ACCEPT_PER_ANNOUNCE) {
             let n = raw.trim();
             if n.parse::<std::net::SocketAddr>().is_ok() {
@@ -1273,7 +1696,7 @@ async fn announce(
     // Network Map: register/refresh the announcing seeder if it advertised a
     // public /metrics URL. Contribution stats are filled by the scrape task.
     if !req.metrics_url.trim().is_empty() {
-        let mut s = state.seeders.lock().unwrap();
+        let mut s = lk(&state.seeders);
         let entry = s.entry(req.endpoint_id.clone()).or_insert_with(|| SeederEntry {
             endpoint_id: req.endpoint_id.clone(),
             node: req.node.clone(),
@@ -1288,6 +1711,7 @@ async fn announce(
             online: false,
             last_scraped: 0,
             dht_addr: String::new(),
+            last_hb: 0,
         });
         entry.node = req.node.clone();
         entry.metrics_url = req.metrics_url.trim().to_string();
@@ -1323,7 +1747,7 @@ async fn seeders_dht(State(state): State<AppState>) -> Json<SeedersDhtResp> {
     let now = now_unix();
     const FRESH_SECS: u64 = 1800; // 30 min
     let mut out: Vec<String> = {
-        let s = state.seeders.lock().unwrap();
+        let s = lk(&state.seeders);
         s.values()
             .filter(|e| !e.dht_addr.is_empty() && e.last_seen + FRESH_SECS > now)
             .map(|e| e.dht_addr.clone())
@@ -1347,7 +1771,7 @@ async fn seeders_dht(State(state): State<AppState>) -> Json<SeedersDhtResp> {
 /// (ip:port) so a peer blocked from public routers/seeder can still join Mainline.
 async fn dht_bootstrap(State(state): State<AppState>) -> Json<Vec<String>> {
     let now = now_unix();
-    let mut pool = state.dht_pool.lock().unwrap();
+    let mut pool = lk(&state.dht_pool);
     pool.retain(|_, ts| *ts + DHT_POOL_TTL_SECS > now);
     let mut by_age: Vec<(String, u64)> = pool.iter().map(|(k, v)| (k.clone(), *v)).collect();
     // freshest first
@@ -1419,7 +1843,7 @@ fn app_to_out(rec: &AppRecord) -> AppOut {
 
 async fn list_apps(State(state): State<AppState>) -> Json<Vec<AppOut>> {
     state.prune();
-    let reg = state.reg.lock().unwrap();
+    let reg = lk(&state.reg);
     // Anti-spam exposure filter: only PAID apps with at least one live seeder are
     // indexed in the public directory. Emergency override: when incentivized
     // seeding is OFF (ENABLE_INCENTIVIZED_SEEDING=false), expose EVERY app so the
@@ -1445,7 +1869,7 @@ async fn get_app(
     Path(id): Path<String>,
 ) -> Result<Json<AppOut>, StatusCode> {
     state.prune();
-    let reg = state.reg.lock().unwrap();
+    let reg = lk(&state.reg);
     match reg.apps.get(&id) {
         Some(rec) => Ok(Json(app_to_out(rec))),
         None => Err(StatusCode::NOT_FOUND),
@@ -1495,6 +1919,48 @@ async fn app_seeders(
 }
 
 
+#[derive(Debug, Serialize)]
+struct FundingHistoryOut {
+    /// txid платежа.
+    id: String,
+    /// unix-время транзакции в цепочке.
+    ts: u64,
+    #[serde(rename = "amountSth")]
+    amount_sth: u64,
+    #[serde(rename = "endsAt")]
+    ends_at: u64,
+    /// окно ещё активно (ts + 5д > now).
+    active: bool,
+    /// буст сидинга (`sth_boost:`) или публикация/обновление (`sth:`).
+    boost: bool,
+}
+
+/// `GET /app/{id}/funding` — полная история платежей приложения (активные и
+/// завершённые окна в пределах FUNDING_RETAIN_SECS), новые сверху. Для таймлайна
+/// на дашборде; `/app/{id}` отдаёт только активные окна.
+async fn app_funding(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<FundingHistoryOut>>, StatusCode> {
+    let now = now_unix();
+    let reg = lk(&state.reg);
+    let rec = reg.apps.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let mut out: Vec<FundingHistoryOut> = rec
+        .funding
+        .iter()
+        .map(|f| FundingHistoryOut {
+            id: f.txid.clone(),
+            ts: f.ts,
+            amount_sth: f.amount_smarthoshi / SMARTHOSHI,
+            ends_at: f.ts + SEEDING_WINDOW_SECS,
+            active: f.ts + SEEDING_WINDOW_SECS > now,
+            boost: f.boost,
+        })
+        .collect();
+    out.sort_by(|a, b| b.ts.cmp(&a.ts));
+    Ok(Json(out))
+}
+
 /// Owner-signed app deletion. Verifies id==address(pubkey) + ECDSA over
 /// sha256(id|delete|ts), then removes the app from the directory and records a
 /// tombstone so it stops being announced and headless seeders purge it.
@@ -1506,13 +1972,13 @@ async fn delete_app_handler(
         return Err((StatusCode::UNAUTHORIZED, e.into()));
     }
     {
-        let mut reg = state.reg.lock().unwrap();
+        let mut reg = lk(&state.reg);
         reg.apps.remove(&req.id);
     }
     let _ = state.db.remove(req.id.as_bytes());
     let now = now_unix();
     {
-        let mut t = state.tombstones.lock().unwrap();
+        let mut t = lk(&state.tombstones);
         t.insert(req.id.clone(), now);
     }
     let _ = state
@@ -1529,7 +1995,7 @@ async fn delete_app_handler(
 /// to purge deleted apps from their blob store and stop seeding them.
 async fn deleted_apps(State(state): State<AppState>) -> Json<Vec<String>> {
     let now = now_unix();
-    let mut t = state.tombstones.lock().unwrap();
+    let mut t = lk(&state.tombstones);
     t.retain(|_, ts| *ts + TOMBSTONE_TTL_SECS > now);
     Json(t.keys().cloned().collect())
 }
@@ -1537,7 +2003,7 @@ async fn deleted_apps(State(state): State<AppState>) -> Json<Vec<String>> {
 async fn seeds(State(state): State<AppState>) -> Json<Vec<SeedOut>> {
     state.prune();
     let now = now_unix();
-    let reg = state.reg.lock().unwrap();
+    let reg = lk(&state.reg);
     // collapse providers across all apps into distinct endpoints
     let mut by_endpoint: HashMap<String, (String, usize)> = HashMap::new();
     for rec in reg.apps.values() {
@@ -1558,17 +2024,112 @@ async fn seeds(State(state): State<AppState>) -> Json<Vec<SeedOut>> {
     Json(out)
 }
 
+/// `GET /health` — ЛЁГКИЙ liveness (v1.7.2): без `prune()`, без похода на диск и
+/// без ожидания мьютекса. Именно этот эндпоинт опрашивают мониторинг и вотчдог,
+/// поэтому он обязан отвечать даже когда реестр занят долгой операцией: занятый
+/// лок отдаётся полем `regBusy`, а не зависанием запроса.
 async fn health(State(state): State<AppState>) -> Json<Health> {
-    state.prune();
-    let reg = state.reg.lock().unwrap();
-    let providers: usize = reg.apps.values().map(|r| r.providers.len()).sum();
+    let guard = match state.reg.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let (apps, providers, busy): (usize, usize, bool) = match guard {
+        Some(reg) => {
+            let p: usize = reg.apps.values().map(|r| r.providers.len()).sum();
+            (reg.apps.len(), p, false)
+        }
+        None => (0, 0, true),
+    };
     Json(Health {
         ok: true,
-        apps: reg.apps.len(),
+        apps,
         providers,
         ttl_secs: state.ttl.as_secs(),
         uptime: state.started.elapsed().as_secs(),
+        reg_busy: busy,
+        heartbeat_age: diag::heartbeat_age(),
+        open_fds: diag::open_fds(),
+        rss_mb: diag::rss_mb(),
+        panics: diag::PANICS.load(Ordering::Relaxed),
     })
+}
+
+/// Какие мьютексы заняты прямо сейчас — единственный способ понять причину
+/// зависания задним числом. `try_lock` не ждёт, поэтому отчёт безопасен.
+fn lock_report(state: &AppState) -> String {
+    fn s<T>(m: &Mutex<T>) -> &'static str {
+        match m.try_lock() {
+            Ok(_) => "free",
+            Err(std::sync::TryLockError::Poisoned(_)) => "POISONED",
+            Err(std::sync::TryLockError::WouldBlock) => "BUSY",
+        }
+    }
+    format!(
+        "reg={} seeders={} tombstones={} dht={} pqweb={} ai={} official={} tickets={}",
+        s(&state.reg),
+        s(&state.seeders),
+        s(&state.tombstones),
+        s(&state.dht_pool),
+        s(&state.pqweb_live),
+        s(&state.ai_pool),
+        s(official_sets()),
+        ai_pool::tickets_state()
+    )
+}
+
+/// Вотчдог в ОТДЕЛЬНОМ ОС-потоке (не в tokio — иначе он залипнет вместе с
+/// рантаймом): каждые 15 с стучится на свой же `/health` и проверяет, что
+/// async-heartbeat растёт. При отказе печатает полный отчёт (процесс, локи,
+/// счётчики) — по требованию оператора процесс НЕ завершается, только логи.
+/// Раз в 5 минут пишет обычный INFO-снимок, чтобы «в логах ничего нет» больше
+/// не повторялось: последняя строка перед тишиной покажет состояние.
+fn spawn_watchdog(state: AppState, port: u16) {
+    let _ = std::thread::Builder::new().name("watchdog".into()).spawn(move || {
+        let mut fails: u32 = 0;
+        let mut ticks: u64 = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(15));
+            ticks += 1;
+            let hb = diag::heartbeat_age();
+            let http_ok = diag::probe_health(port);
+            let stalled_runtime = hb > 60;
+            if http_ok && !stalled_runtime {
+                if fails > 0 {
+                    tracing::warn!("watchdog: трекер снова отвечает (было {fails} неудачных проб подряд)");
+                    fails = 0;
+                }
+                if ticks % 20 == 0 {
+                    tracing::info!(
+                        "watchdog: ok · uptime={}s heartbeat={}s {} | locks: {}",
+                        state.started.elapsed().as_secs(),
+                        hb,
+                        diag::proc_report(),
+                        lock_report(&state)
+                    );
+                }
+                continue;
+            }
+            fails += 1;
+            tracing::error!(
+                "watchdog: трекер НЕ отвечает (проба #{fails}) · http_health={} heartbeat_age={}s {} | locks: {} | announce={} accepted={} rejected={}",
+                http_ok,
+                hb,
+                diag::proc_report(),
+                lock_report(&state),
+                state.stats.announce_requests.load(Ordering::Relaxed),
+                state.stats.accepted.load(Ordering::Relaxed),
+                state.stats.rejected.load(Ordering::Relaxed)
+            );
+            if fails == 1 {
+                tracing::error!(
+                    "watchdog: подсказка — BUSY-мьютекс указывает на застрявшую критическую секцию, \
+                     рост fd у лимита означает утечку соединений (поднимите ulimit -n), \
+                     heartbeat_age > 60 с означает залипший рантайм tokio"
+                );
+            }
+        }
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -1593,6 +2154,12 @@ struct TopApp {
     /// секунд до конца оплаченного сидинга (0 = не активен).
     #[serde(rename = "secondsRemaining")]
     seconds_remaining: u64,
+    /// unix-время последнего платежа (publish/update/boost) по цепочке; 0 = нет.
+    #[serde(rename = "lastPaidTs")]
+    last_paid_ts: u64,
+    /// число активных 5-дневных окон (funding-событий с ts + 5д > now).
+    #[serde(rename = "activeWindows")]
+    active_windows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1618,6 +2185,9 @@ struct StatsOut {
     client_seeders: usize,
     #[serde(rename = "seedersOnline")]
     seeders_online: usize,
+    /// v1.6.7: pq-web egress nodes currently served by GET /pqweb (env + live heartbeats).
+    #[serde(default, rename = "pqwebNodes")]
+    pqweb_nodes: usize,
     /// Operator signing pubkey (secp256k1 compressed, hex). Empty when signing is
     /// off. Lets clients auto-pin (TOFU) the key for /seeders-dht verification —
     /// old trackers simply omit it and clients stay in unsigned mode.
@@ -1672,11 +2242,29 @@ const STATUS_HTML: &str = r###"<!doctype html>
   .foot{margin-top:26px;color:var(--dim);font-size:11px;letter-spacing:.06em}
   .badge{display:inline-block;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:11px;color:var(--dim)}
   a{color:var(--accent)}
+  .ver{font-size:13px;letter-spacing:.1em;color:var(--dim);font-weight:400;vertical-align:middle}
+  tr.app{cursor:pointer}
+  tr.app:hover td{background:rgba(255,255,255,.025)}
+  tr.app.open td{border-bottom-color:transparent}
+  td.fund{padding:0 10px 14px 24px;background:rgba(255,255,255,.015)}
+  table.tl{width:auto;min-width:60%}
+  table.tl th,table.tl td{padding:5px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,.05)}
+  .tl .act{color:var(--ok);font-weight:700}
+  .tl .end{color:var(--dim)}
+  .tl .boost{color:var(--gold)}
+  .tl-sect{font-size:10px;letter-spacing:.12em;color:var(--dim);text-transform:uppercase;margin:12px 0 6px}
+  table.sd td.h{text-align:center;font-variant-numeric:tabular-nums}
+  .sd .ok{color:var(--ok);font-weight:700}
+  .sd .mid{color:var(--gold)}
+  .sd .no{color:var(--dim);opacity:.55}
+  .sd .addr{color:var(--accent);font-size:11px}
+  .sd .on{color:var(--ok)}
+  .sd .off{color:var(--dim)}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>// SMARTNET TRACKER_</h1>
+  <h1>// SMARTNET TRACKER_ <span class="ver">v__VERSION__</span></h1>
   <div class="sub">WAN dApp discovery directory &middot; in-memory &middot; signed announces</div>
   <div class="status"><span class="dot"></span><span id="status">CONNECTING&hellip;</span></div>
 
@@ -1684,6 +2272,7 @@ const STATUS_HTML: &str = r###"<!doctype html>
     <div class="card"><div class="k">Nodes online</div><div class="v accent" id="endpoints">&mdash;</div></div>
     <div class="card"><div class="k">Apps</div><div class="v" id="apps">&mdash;</div></div>
     <div class="card"><div class="k">Providers</div><div class="v" id="providers">&mdash;</div></div>
+    <div class="card"><div class="k">PQ Web nodes</div><div class="v" id="pqweb">&mdash;</div></div>
     <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">&mdash;</div></div>
   </div>
 
@@ -1696,7 +2285,7 @@ const STATUS_HTML: &str = r###"<!doctype html>
 
   <div class="sect">Top apps by seeds</div>
   <table>
-    <thead><tr><th>App ID</th><th>Name</th><th>Ver</th><th style="text-align:center">Paid</th><th style="text-align:right">Bank</th><th style="text-align:right">Seed left</th><th style="text-align:right">Seeds</th></tr></thead>
+    <thead><tr><th>App ID</th><th>Name</th><th>Ver</th><th style="text-align:center">Paid</th><th style="text-align:right">Bank</th><th style="text-align:right">Last pay</th><th style="text-align:center">Win</th><th style="text-align:right">Seed left</th><th style="text-align:right">Seeds</th></tr></thead>
     <tbody id="top"><tr><td class="empty" colspan="7">loading&hellip;</td></tr></tbody>
   </table>
 
@@ -1710,6 +2299,8 @@ function fmtUptime(s){var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Mat
   if(d>0)return d+'d '+h+'h';if(h>0)return h+'h '+m+'m';if(m>0)return m+'m';return s+'s';}
 function fmtLeft(s){if(!s||s<=0)return '&mdash;';var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   if(d>0)return d+'d '+h+'h';if(h>0)return h+'h '+m+'m';return m+'m';}
+function fmtDate(ts){var dt=new Date(ts*1000),p=function(n){return (n<10?'0':'')+n;};
+  return dt.getFullYear()+'-'+p(dt.getMonth()+1)+'-'+p(dt.getDate())+' '+p(dt.getHours())+':'+p(dt.getMinutes());}
 function esc(t){var e=document.createElement('div');e.textContent=t==null?'':t;return e.innerHTML;}
 async function tick(){
   try{
@@ -1718,6 +2309,7 @@ async function tick(){
     document.getElementById('endpoints').textContent=d.endpoints;
     document.getElementById('apps').textContent=d.apps;
     document.getElementById('providers').textContent=d.providers;
+    var pq=document.getElementById('pqweb'); if(pq) pq.textContent=(d.pqwebNodes==null?'—':d.pqwebNodes);
     document.getElementById('uptime').textContent=fmtUptime(d.uptimeSecs);
     document.getElementById('req').textContent=d.totals.announceRequests;
     document.getElementById('acc').textContent=d.totals.accepted;
@@ -1727,21 +2319,88 @@ async function tick(){
     var tb=document.getElementById('top');
     if(d.topApps&&d.topApps.length){
       tb.innerHTML=d.topApps.map(function(a){
+        var tail=(openId===a.id)?renderFunding(a.id):'';
         var paid=a.paid?'<span style="color:var(--ok);font-weight:700">PAID</span>':'<span style="color:var(--dim)">&mdash;</span>';
         var bank=(a.bankSth>0)?('<span style="color:var(--gold)">'+a.bankSth+' STH</span>'):'<span style="color:var(--dim)">&mdash;</span>';
         var left=fmtLeft(a.secondsRemaining||0);
-        return '<tr><td class="id">'+esc(a.id)+'</td><td>'+(esc(a.name)||'<span style="color:var(--dim)">no name</span>')+'</td><td style="color:var(--dim)">v'+(a.version||1)+'</td><td style="text-align:center">'+paid+'</td><td style="text-align:right">'+bank+'</td><td style="text-align:right;color:var(--dim)">'+left+'</td><td class="seeds">'+a.seeds+'</td></tr>';}).join('');
-    }else{tb.innerHTML='<tr><td class="empty" colspan="7">no apps announced yet</td></tr>';}
+        var lastPay=a.lastPaidTs?('<span title="'+new Date(a.lastPaidTs*1000).toISOString()+'">'+fmtDate(a.lastPaidTs)+'</span>'):'<span style="color:var(--dim)">&mdash;</span>';
+        var win=(a.activeWindows>0)?('<span style="color:var(--ok);font-weight:700">'+a.activeWindows+'</span>'):'<span style="color:var(--dim)">0</span>';
+        return '<tr class="app'+(openId===a.id?' open':'')+'" data-id="'+esc(a.id)+'" data-testid="app-row" title="click: funding timeline"><td class="id">'+esc(a.id)+'</td><td>'+(esc(a.name)||'<span style="color:var(--dim)">no name</span>')+'</td><td style="color:var(--dim)">v'+(a.version||1)+'</td><td style="text-align:center">'+paid+'</td><td style="text-align:right">'+bank+'</td><td style="text-align:right;color:var(--dim);white-space:nowrap" data-testid="last-pay">'+lastPay+'</td><td style="text-align:center" data-testid="active-windows">'+win+'</td><td style="text-align:right;color:var(--dim)">'+left+'</td><td class="seeds">'+a.seeds+'</td></tr>'+tail;}).join('');
+    }else{tb.innerHTML='<tr><td class="empty" colspan="9">no apps announced yet</td></tr>';}
     document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();
   }catch(e){document.getElementById('status').textContent='OFFLINE';}
 }
+// ---- Funding timeline: клик по строке dApp раскрывает все платежи ----
+var openId=null,fundCache={};
+function fmtSth(n){return n+' STH';}
+function renderFunding(id){
+  var list=fundCache[id];
+  var body;
+  if(!list)body='<div class="empty">loading&hellip;</div>';
+  else if(!list.length)body='<div class="empty">no payments in the last 30 days</div>';
+  else{
+    var now=Date.now()/1000;
+    body='<table class="tl" data-testid="funding-timeline"><thead><tr><th>Date</th><th>Type</th><th style="text-align:right">Amount</th><th>Window ends</th><th>Status</th><th>Tx</th></tr></thead><tbody>'+
+      list.map(function(f){
+        var st=f.active?'<span class="act">ACTIVE &middot; '+fmtLeft(Math.max(0,f.endsAt-now))+' left</span>':'<span class="end">ENDED</span>';
+        var tp=f.boost?'<span class="boost">boost</span>':'publish';
+        return '<tr><td>'+fmtDate(f.ts)+'</td><td>'+tp+'</td><td style="text-align:right;color:var(--gold)">'+fmtSth(f.amountSth)+'</td><td>'+fmtDate(f.endsAt)+'</td><td>'+st+'</td><td class="id" title="'+esc(f.id)+'">'+esc((f.id||'').slice(0,10))+'&hellip;</td></tr>';
+      }).join('')+'</tbody></table>';
+  }
+  return '<tr class="fund-row" data-testid="funding-row"><td class="fund" colspan="9">'+body+renderSeeders(id)+'</td></tr>';
+}
+// ---- Seeder timeline: онлайн-часы по дням (UTC), как их видит payments-server.
+// Порог выплаты за день: офлайн внутри дня <= 12ч, т.е. >= 12ч онлайна (зелёный).
+var SEED_DAYS=7, ELIGIBLE_SECS=12*3600;
+function dayLabel(dn){var d=new Date(dn*86400*1000);var p=function(n){return (n<10?'0':'')+n;};return p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate());}
+function renderSeeders(id){
+  var list=seedCache[id];
+  if(!list)return '<div class="tl-sect">seeders</div><div class="empty">loading&hellip;</div>';
+  if(!list.length)return '<div class="tl-sect">seeders</div><div class="empty">no seeder heartbeats for this app</div>';
+  var today=Math.floor(Date.now()/86400000),days=[];
+  for(var i=SEED_DAYS-1;i>=0;i--)days.push(today-i);
+  list=list.slice().sort(function(a,b){return (b.online-a.online)||((b.days&&b.days[today])||0)-((a.days&&a.days[today])||0);});
+  var head='<tr><th>Seeder</th><th></th>'+days.map(function(dn){return '<th style="text-align:center">'+dayLabel(dn)+(dn===today?' *':'')+'</th>';}).join('')+'</tr>';
+  var rows=list.map(function(s){
+    var cells=days.map(function(dn){
+      var secs=(s.days&&s.days[dn])||0;
+      if(!secs)return '<td class="h no">&mdash;</td>';
+      var cls=secs>=ELIGIBLE_SECS?'ok':'mid';
+      return '<td class="h '+cls+'" title="'+secs+' s">'+(secs/3600).toFixed(1)+'h</td>';
+    }).join('');
+    return '<tr><td class="addr" title="'+esc(s.address)+'">'+esc(s.address.slice(0,12))+'&hellip;</td><td class="'+(s.online?'on':'off')+'">'+(s.online?'&#9679; online':'offline')+'</td>'+cells+'</tr>';
+  }).join('');
+  return '<div class="tl-sect">seeders &middot; online hours by day (UTC) &middot; <span class="ok" style="color:var(--ok)">&ge;12h = paid day</span> &middot; * today (partial)</div>'+
+    '<table class="tl sd" data-testid="seeder-timeline"><thead>'+head+'</thead><tbody>'+rows+'</tbody></table>';
+}
+var seedCache={};
+async function loadSeeders(id){
+  try{var r=await fetch('/app/'+encodeURIComponent(id)+'/seeders',{cache:'no-store'});seedCache[id]=r.ok?await r.json():[];}
+  catch(e){seedCache[id]=[];}
+}
+async function loadFunding(id){
+  try{var r=await fetch('/app/'+encodeURIComponent(id)+'/funding',{cache:'no-store'});fundCache[id]=r.ok?await r.json():[];}
+  catch(e){fundCache[id]=[];}
+  await loadSeeders(id);
+  if(openId===id){var row=document.querySelector('tr.app[data-id="'+id+'"]');var old=row&&row.nextElementSibling;
+    if(row&&old&&old.classList.contains('fund-row')){old.outerHTML=renderFunding(id);}}
+}
+document.getElementById('top').addEventListener('click',function(ev){
+  var tr=ev.target.closest('tr.app');if(!tr)return;
+  var id=tr.getAttribute('data-id');
+  openId=(openId===id)?null:id;
+  if(openId){loadFunding(openId);}
+  tick();
+});
+var _tick=tick;
+tick=async function(){await _tick();if(openId&&fundCache[openId])loadFunding(openId);};
 tick();setInterval(tick,3000);
 </script>
 </body>
 </html>"###;
 
-async fn index() -> Html<&'static str> {
-    Html(STATUS_HTML)
+async fn index() -> Html<String> {
+    Html(STATUS_HTML.replace("__VERSION__", env!("CARGO_PKG_VERSION")))
 }
 
 
@@ -1750,7 +2409,7 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
     // Seeder split (deduped by reward node) — computed before locking the app
     // registry to keep a single, consistent lock order.
     let (server_seeders, client_seeders, seeders_online) = {
-        let s = state.seeders.lock().unwrap();
+        let s = lk(&state.seeders);
         let deduped = deduped_seeders(&s);
         let mut srv = 0usize;
         let mut cli = 0usize;
@@ -1767,7 +2426,7 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
         }
         (srv, cli, online)
     };
-    let reg = state.reg.lock().unwrap();
+    let reg = lk(&state.reg);
     let providers: usize = reg.apps.values().map(|r| r.providers.len()).sum();
     let mut endpoints = std::collections::HashSet::new();
     for r in reg.apps.values() {
@@ -1783,10 +2442,13 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
             // банк активных окон (cost) + буст, и остаток самого позднего окна
             let mut bank = 0u64;
             let mut ends_max = 0u64;
+            let mut active_windows = 0usize;
             for f in r.funding.iter().filter(|f| f.ts + SEEDING_WINDOW_SECS > now_ts) {
                 bank = bank.saturating_add(f.amount_smarthoshi / SMARTHOSHI);
                 ends_max = ends_max.max(f.ts + SEEDING_WINDOW_SECS);
+                active_windows += 1;
             }
+            let last_paid_ts = r.funding.iter().map(|f| f.ts).max().unwrap_or(0);
             TopApp {
                 id: r.id.clone(),
                 name: r.name.clone(),
@@ -1795,6 +2457,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
                 paid: r.paid,
                 bank_sth: bank,
                 seconds_remaining: ends_max.saturating_sub(now_ts),
+                last_paid_ts,
+                active_windows,
             }
         })
         .collect();
@@ -1822,6 +2486,10 @@ async fn stats(State(state): State<AppState>) -> Json<StatsOut> {
         server_seeders,
         client_seeders,
         seeders_online,
+        pqweb_nodes: {
+            let live = pqweb_live_nodes(&state);
+            state.pqweb_nodes.len() + live.iter().filter(|l| !l.verified).count()
+        },
         pubkey: operator_pubkey_hex(&state),
     })
 }
@@ -1869,7 +2537,7 @@ struct SeederOut {
 /// haven't heard an announce from in over an hour.
 async fn scrape_seeders(state: &AppState) {
     let targets: Vec<(String, String)> = {
-        let s = state.seeders.lock().unwrap();
+        let s = lk(&state.seeders);
         s.values()
             .filter(|e| !e.metrics_url.trim().is_empty())
             .map(|e| (e.endpoint_id.clone(), e.metrics_url.clone()))
@@ -1878,8 +2546,8 @@ async fn scrape_seeders(state: &AppState) {
     for (eid, url) in targets {
         let u = url.clone();
         let scraped = tokio::task::spawn_blocking(move || {
-            ureq::get(&u)
-                .timeout(Duration::from_secs(8))
+            http_agent()
+                .get(&u)
                 .call()
                 .ok()
                 .and_then(|r| r.into_string().ok())
@@ -1888,7 +2556,7 @@ async fn scrape_seeders(state: &AppState) {
         .await
         .ok()
         .flatten();
-        let mut s = state.seeders.lock().unwrap();
+        let mut s = lk(&state.seeders);
         if let Some(e) = s.get_mut(&eid) {
             match scraped {
                 Some(m) => {
@@ -1909,12 +2577,14 @@ async fn scrape_seeders(state: &AppState) {
                     e.online = true;
                     e.last_scraped = now_unix();
                 }
-                None => e.online = false,
+                // Метрики недоступны (закрыт порт / NAT): жив ли адрес по подписанным
+                // heartbeat'ам за последние 2 слота — тогда он всё же в сети.
+                None => e.online = now_unix().saturating_sub(e.last_hb) < 2 * HB_SLOT_SECS,
             }
         }
     }
     let now = now_unix();
-    state.seeders.lock().unwrap().retain(|_, e| {
+    lk(&state.seeders).retain(|_, e| {
         // Client home-nodes (no /metrics) are pruned fast — 2 heartbeat slots —
         // so the map only ever shows currently-live clients. Headless servers
         // keep the 1h grace window (the /metrics scrape refreshes them).
@@ -1928,7 +2598,7 @@ async fn scrape_seeders(state: &AppState) {
 }
 
 async fn seeders_list(State(state): State<AppState>) -> Json<Vec<SeederOut>> {
-    let s = state.seeders.lock().unwrap();
+    let s = lk(&state.seeders);
     // Collapse by reward node address (fall back to endpointId) so a seeder
     // that restarted with a fresh ephemeral endpointId isn't shown twice.
     // Prefer the online entry, then higher score, then the most recent.
@@ -2043,7 +2713,7 @@ fn read_net_history(db: &sled::Db) -> Vec<NetPoint> {
 /// Append a global seeded-GB snapshot (throttled to ~30 min) and trim to 24h.
 fn record_network_history(state: &AppState) {
     let used = {
-        let s = state.seeders.lock().unwrap();
+        let s = lk(&state.seeders);
         deduped_seeders(&s)
             .iter()
             .map(|e| e.gb_seeded.max(0.0))
@@ -2074,7 +2744,7 @@ fn round2(v: f64) -> f64 {
 /// `GET /network/storage` — global cloud capacity meter for the dashboard.
 async fn network_storage(State(state): State<AppState>) -> Json<NetworkStorageStats> {
     let nodes = {
-        let s = state.seeders.lock().unwrap();
+        let s = lk(&state.seeders);
         deduped_seeders(&s)
     };
     let mut capacity = 0.0f64;
@@ -2207,7 +2877,7 @@ async fn network_map_page() -> Html<&'static str> {
 // ============================================================
 
 fn http_get_json(url: &str) -> Option<serde_json::Value> {
-    match ureq::get(url).timeout(Duration::from_secs(12)).call() {
+    match http_agent().get(url).call() {
         Ok(resp) => resp.into_string().ok().and_then(|s| serde_json::from_str(&s).ok()),
         Err(_) => None,
     }
@@ -2321,8 +2991,9 @@ fn fetch_paid_amounts() -> HashMap<String, u64> {
 /// funding-событий. В отличие от fetch_paid_amounts (только максимум) возвращает
 /// КАЖДУЮ транзакцию, чтобы каждое платное обновление (reseeding) стало отдельным
 /// банком на 5 дней. Дедуп по txid делается на стороне verify_payments.
-fn fetch_funding_txs() -> HashMap<String, Vec<(String, u64, bool)>> {
-    let mut out: HashMap<String, Vec<(String, u64, bool)>> = HashMap::new();
+/// Кортеж: (txid, amount_smarthoshi, is_boost, chain_ts_unix).
+fn fetch_funding_txs() -> HashMap<String, Vec<(String, u64, bool, u64)>> {
+    let mut out: HashMap<String, Vec<(String, u64, bool, u64)>> = HashMap::new();
     for page in 1..=3u32 {
         let url = format!(
             "{}/transactions?recipientId={}&page={}&limit=100&orderBy=timestamp:desc",
@@ -2341,6 +3012,11 @@ fn fetch_funding_txs() -> HashMap<String, Vec<(String, u64, bool)>> {
                 .unwrap_or(0);
             let txid = t["id"].as_str().unwrap_or("").trim().to_string();
             let field = t["vendorField"].as_str().unwrap_or("");
+            // время транзакции в цепочке; 0 = нет поля (событие пропускаем)
+            let ts = t["timestamp"]["unix"]
+                .as_u64()
+                .or_else(|| t["timestamp"]["unix"].as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
             // publish/update (`sth:<id>`) — банк, требующий порога цены;
             // boost (`sth_boost:<id>`) — банк без порога (доп. награда сидерам).
             let (id_opt, is_boost) = if let Some(id) = field.strip_prefix("sth_boost:") {
@@ -2352,8 +3028,8 @@ fn fetch_funding_txs() -> HashMap<String, Vec<(String, u64, bool)>> {
             };
             if let Some(id) = id_opt {
                 let id = id.trim();
-                if !id.is_empty() && amt > 0 && !txid.is_empty() {
-                    out.entry(id.to_string()).or_default().push((txid, amt, is_boost));
+                if !id.is_empty() && amt > 0 && !txid.is_empty() && ts > 0 {
+                    out.entry(id.to_string()).or_default().push((txid, amt, is_boost, ts));
                 }
             }
         }
@@ -2403,7 +3079,7 @@ fn verify_payments(state: &AppState) {
     let now = now_unix();
     let mut changed: Vec<String> = Vec::new();
     {
-        let mut reg = state.reg.lock().unwrap();
+        let mut reg = lk(&state.reg);
         for (id, rec) in reg.apps.iter_mut() {
             let min_sth = compute_cost(base, price_mb, rec.size_bytes);
             let min_smarthoshi = min_sth.saturating_mul(SMARTHOSHI);
@@ -2411,19 +3087,37 @@ fn verify_payments(state: &AppState) {
 
             // Phase G: добавляем НОВЫЕ funding-события (каждое платное обновление —
             // отдельный банк на 5 дней). Дедуп по txid; порог — динамическая цена.
+            // ts = время транзакции в цепочке: платежи старше окна хранения не
+            // заводим вовсе (иначе после рестарта/purge они получали бы новое окно).
             if let Some(list) = funding_txs.get(id) {
-                let known: std::collections::HashSet<String> =
-                    rec.funding.iter().map(|f| f.txid.clone()).collect();
-                for (txid, amt, is_boost) in list {
+                for (txid, amt, is_boost, chain_ts) in list {
                     let threshold = if *is_boost { 1 } else { min_smarthoshi };
-                    if *amt >= threshold && !known.contains(txid) {
-                        rec.funding.push(FundingEvent {
-                            ts: now,
-                            amount_smarthoshi: *amt,
-                            txid: txid.clone(),
-                        });
-                        touched = true;
+                    if *amt < threshold {
+                        continue;
                     }
+                    if let Some(f) = rec.funding.iter_mut().find(|f| f.txid == *txid) {
+                        // миграция: событие помечено временем обнаружения трекером,
+                        // а не цепочки — сдвигаем на реальное время транзакции
+                        if f.ts != *chain_ts {
+                            f.ts = *chain_ts;
+                            touched = true;
+                        }
+                        if f.boost != *is_boost {
+                            f.boost = *is_boost;
+                            touched = true;
+                        }
+                        continue;
+                    }
+                    if chain_ts + FUNDING_RETAIN_SECS <= now {
+                        continue;
+                    }
+                    rec.funding.push(FundingEvent {
+                        ts: *chain_ts,
+                        amount_smarthoshi: *amt,
+                        txid: txid.clone(),
+                        boost: *is_boost,
+                    });
+                    touched = true;
                 }
             }
             // чистим совсем старые события (за пределами окна хранения дедупа)
@@ -2488,6 +3182,20 @@ fn verify_payments(state: &AppState) {
 
 #[tokio::main]
 async fn main() {
+    // `--version` / `--help`: отвечаем до открытия sled — БД может быть занята
+    // работающим трекером (lock → WouldBlock), а версия ей не нужна.
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("ntfry-tracker {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::env::args().skip(1).any(|a| a == "--help" || a == "-h") {
+        println!(
+            "ntfry-tracker {}\n\nUSAGE:\n  ntfry-tracker [--version | --help | --wipe]\n\nOPTIONS:\n  -V, --version   print version and exit\n  -h, --help      print this help and exit\n      --wipe      remove persisted DB dir (SMARTNET_TRACKER_DB, default ./tracker-data) and exit",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+
     // Подхватываем настройки из `.env` (если файл рядом с бинарником или в текущей
     // директории). Даёт удобство хостинга на VPS: одна правка `.env` вместо экспорта
     // переменных вручную. Ошибка отсутствия файла игнорируется — env-переменные
@@ -2497,9 +3205,12 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "smartnet_tracker=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "ntfry_tracker=info,tower_http=warn".into()),
         )
         .init();
+    // v1.7.2: паники (в т.ч. внутри обработчиков) обязаны попадать в лог —
+    // раньше отказ трекера не оставлял ни одной строки.
+    diag::install_panic_hook();
 
     // DB location (override with SMARTNET_TRACKER_DB).
     let db_path =
@@ -2567,7 +3278,17 @@ async fn main() {
             .ok()
             .and_then(|h| hex::decode(h.trim()).ok())
             .and_then(|b| SecretKey::from_slice(&b).ok()),
+        ai_pool: ai_pool::new_pool(),
+        pqweb_nodes: Arc::new(parse_pqweb_nodes(&std::env::var("PQWEB_NODES").unwrap_or_default())),
+        pqweb_live: Arc::new(Mutex::new(HashMap::new())),
+        sth_hints: sth_hints::new_map(),
+        sth_pool: sth_hints::new_pool(),
     };
+    if state.pqweb_nodes.is_empty() {
+        tracing::info!("PQ Web: open self-registration (POST /pqweb/announce), signed={}", state.operator_sk.is_some());
+    } else {
+        tracing::info!("PQ Web: allowlist of {} node(s) (env PQWEB_NODES) — announces from other ids rejected, signed={}", state.pqweb_nodes.len(), state.operator_sk.is_some());
+    }
     if state.operator_sk.is_some() {
         let pk = PublicKey::from_secret_key(&Secp256k1::new(), state.operator_sk.as_ref().unwrap());
         tracing::info!("operator signing ENABLED — /seeders-dht pubkey: {}", hex::encode(pk.serialize()));
@@ -2584,6 +3305,32 @@ async fn main() {
             }
         });
     }
+
+    // v1.7.2: сброс sled на диск ТОЛЬКО здесь (fsync вынесен из обработчиков и
+    // из-под мьютексов — раньше он подвешивал весь трекер) и строго в
+    // blocking-пуле, чтобы не занимать воркеры рантайма.
+    {
+        let bg = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                let db = bg.db.clone();
+                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || db.flush()).await {
+                    tracing::warn!("sled flush: {e}");
+                }
+            }
+        });
+    }
+
+    // v1.7.2: heartbeat рантайма — если это значение перестаёт расти, залип сам
+    // tokio (вотчдог в отдельном ОС-потоке это увидит и напишет в лог).
+    tokio::spawn(async move {
+        loop {
+            diag::HEARTBEAT.store(now_unix(), Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 
     // Network Map: periodically scrape each seeder's /metrics for fresh
     // contribution stats and recompute the Byte-Hours leaderboard score.
@@ -2630,7 +3377,6 @@ async fn main() {
     }
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
-
     let app = Router::new()
         .route("/", get(index))
         .route("/announce", post(announce))
@@ -2639,10 +3385,17 @@ async fn main() {
         .route("/apps", get(list_apps))
         .route("/app/{id}", get(get_app))
         .route("/app/{id}/seeders", get(app_seeders))
+        .route("/app/{id}/funding", get(app_funding))
         .route("/seeds", get(seeds))
         .route("/seeders", get(seeders_list))
         .route("/seeders-dht", get(seeders_dht))
         .route("/operator-pubkey", get(operator_pubkey))
+        .route("/pqweb", get(pqweb_nodes))
+        .route("/pqweb/announce", post(pqweb_announce))
+        .route("/sth/hint", post(sth_hints::sth_hint))
+        .route("/sth/hints", get(sth_hints::sth_hints))
+        .route("/sth/announce", post(sth_hints::sth_announce))
+        .route("/sth/pool", get(sth_hints::sth_pool))
         .route("/dht", get(dht_bootstrap))
         .route("/network/storage", get(network_storage))
         .route("/seeder/heartbeat", post(seeder_heartbeat))
@@ -2650,10 +3403,27 @@ async fn main() {
         .route("/map", get(network_map_page))
         .route("/stats", get(stats))
         .route("/health", get(health))
+        .route("/v1/ai/heartbeat", post(ai_pool::ai_heartbeat))
+        .route("/v1/ai/stats", get(ai_pool::ai_stats))
+        .route("/v1/ai/pick", get(ai_pool::ai_pick))
+        .route("/v1/ai/shard-nodes", get(ai_pool::ai_shard_nodes))
+        .route(
+            "/v1/ai/model-ticket",
+            post(ai_pool::ai_model_ticket_put).get(ai_pool::ai_model_ticket_get),
+        )
         .layer(cors)
-        .with_state(state);
+        // v1.7.2: паника в обработчике больше не рвёт соединение молча — 500 + запись
+        // в лог (panic hook), а любой запрос, зависший дольше 25 с, снимается таймаутом,
+        // чтобы соединения и воркеры не копились до отказа порта.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(25),
+        ))
+        .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{}", port);
+    spawn_announce_summary();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind tracker port");
@@ -2666,6 +3436,19 @@ async fn main() {
         "announce logging: {} (toggle with SMARTNET_TRACKER_LOG_ANNOUNCE)",
         if log_announce { "ON" } else { "OFF" }
     );
+    // v1.7.2: стартовый снимок + предупреждение о низком лимите дескрипторов
+    // (при запуске из shell/nohup это обычно 1024 — при утечке соединений порт
+    // перестаёт принимать запросы без единой строки в логе).
+    let (soft, hard) = diag::nofile_limit();
+    tracing::info!("diag: {} | sled={} ", diag::proc_report(), db_path);
+    if soft > 0 && soft < 8192 {
+        tracing::warn!(
+            "низкий лимит открытых файлов: soft={soft} hard={hard} — запускайте с `ulimit -n 65535` \
+             (или через systemd с LimitNOFILE=65535), иначе при утечке соединений трекер \
+             перестанет принимать запросы"
+        );
+    }
+    spawn_watchdog(state.clone(), port);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

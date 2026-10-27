@@ -1,3 +1,4 @@
+![ntfry-tracker.jpg](ntfry-tracker.jpg)
 # SmartNet Tracker
 
 A lightweight, standalone Rust (axum) **bootstrap directory** for WAN dApp
@@ -22,7 +23,7 @@ the client. A spoofed announcement is rejected:
 ```bash
 cd tracker
 cargo build --release
-./target/release/smartnet-tracker
+./target/release/ntfry-tracker
 ```
 
 Defaults: binds `0.0.0.0:7374`, announcement TTL `120s`.
@@ -33,7 +34,7 @@ Override via env:
 SMARTNET_TRACKER_PORT=7374 \
 SMARTNET_TRACKER_TTL=120 \
 SMARTNET_TRACKER_LOG_ANNOUNCE=1 \
-  ./target/release/smartnet-tracker
+  ./target/release/ntfry-tracker
 ```
 
 - `SMARTNET_TRACKER_LOG_ANNOUNCE` — log every accepted (`INFO`) / rejected
