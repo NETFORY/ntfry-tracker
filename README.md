@@ -1,4 +1,4 @@
-# SmartNet Tracker (`ntfry-tracker`)
+# Tracker (`ntfry-tracker`)
 
 A lightweight, standalone Rust (axum) **bootstrap directory** for WAN dApp
 discovery. It lets SmartNet nodes find each other over the internet when LAN
