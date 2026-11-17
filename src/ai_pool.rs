@@ -1,5 +1,5 @@
 // ============================================================
-//  ai_pool Netfory AI Pool aggregation (Phase 1)
+//  ai_pool - Netfory AI Pool aggregation (Phase 1)
 //
 //  Приём подписанных AI-heartbeat'ов от opt-in нод (GPU/CPU/RAM метрики),
 //  in-memory реестр с TTL 45s и агрегированные AI Stats для клиентского UI.
@@ -8,8 +8,8 @@
 //    sha256("staih|addr|ts|model|vramT|vramF|tflops*10|thr|ramT|ramF")
 //
 //  Endpoints:
-//    POST /v1/ai/heartbeat телеметрия ноды (подпись secp256k1)
-//    GET  /v1/ai/stats     суммарные мощности активных нод
+//    POST /v1/ai/heartbeat - телеметрия ноды (подпись secp256k1)
+//    GET  /v1/ai/stats     - суммарные мощности активных нод
 // ============================================================
 
 use axum::{
@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{address_from_pubkey, now_unix, sha256, AppState};
 
-// ---------- реестр тикетов моделей: alias → "<hash>@<nodeId>" ----------
+// ---------- реестр тикетов моделей: alias -> "<hash>@<nodeId>" ----------
 // DEV-нода регистрирует тикет при publish-model --alias; шлюзы скачивают
 // draft/модель по alias (--draft qwen3-0.6b, fetch-model qwen3-0.6b).
 
@@ -60,7 +60,7 @@ pub struct TicketQuery {
     pub alias: String,
 }
 
-/// POST /v1/ai/model-ticket {alias, ticket} регистрация тикета модели.
+/// POST /v1/ai/model-ticket {alias, ticket} - регистрация тикета модели.
 pub async fn ai_model_ticket_put(Json(b): Json<TicketIn>) -> (StatusCode, Json<serde_json::Value>) {
     let alias = b.alias.trim().to_lowercase();
     let ticket = b.ticket.trim().to_string();
@@ -83,7 +83,7 @@ pub async fn ai_model_ticket_put(Json(b): Json<TicketIn>) -> (StatusCode, Json<s
     (StatusCode::OK, Json(serde_json::json!({"ok": true, "alias": alias})))
 }
 
-/// GET /v1/ai/model-ticket?alias=x тикет модели по alias.
+/// GET /v1/ai/model-ticket?alias=x - тикет модели по alias.
 pub async fn ai_model_ticket_get(Query(q): Query<TicketQuery>) -> (StatusCode, Json<serde_json::Value>) {
     let alias = q.alias.trim().to_lowercase();
     let mut map = crate::lk(tickets());
@@ -129,11 +129,11 @@ pub struct AiNodeEntry {
     pub threads: u32,
     pub ram_total_mb: u64,
     pub ram_free_mb: u64,
-    /// ai://-адрес воркера (iroh NodeId) если нода принимает инференс
+    /// ai://-адрес воркера (iroh NodeId) - если нода принимает инференс
     pub iroh_node_id: Option<String>,
     /// alias'ы загруженных моделей
     pub models: Vec<String>,
-    /// перегрев/лимит диспетчер такие ноды не выбирает
+    /// перегрев/лимит - диспетчер такие ноды не выбирает
     pub throttled: bool,
     pub cuda_capability: Option<String>,
     /// готова принять LoadShard от шлюза (авто-разрезка)
@@ -262,7 +262,7 @@ pub async fn ai_heartbeat(
     let mut pool = crate::lk(&state.ai_pool);
     prune(&mut pool, now);
     if !hb.ai_pool_enabled {
-        // вежливый opt-out: нода выключила AI Pool убираем сразу
+        // вежливый opt-out: нода выключила AI Pool - убираем сразу
         pool.remove(&hb.node_id);
         return Ok(StatusCode::OK);
     }
@@ -309,7 +309,7 @@ pub async fn ai_heartbeat(
 
 /// Диспетчер: выбрать лучшего исполнителя для инференса.
 /// Фильтры: есть GPU, не throttled, есть ai://-адрес, модель загружена (если
-/// задана ?model=), VRAM ≥ ?minVramMb. Сортировка: max VRAM free → max TFLOPS.
+/// задана ?model=), VRAM ≥ ?minVramMb. Сортировка: max VRAM free -> max TFLOPS.
 #[derive(Deserialize)]
 pub struct PickQuery {
     #[serde(default)]
@@ -389,7 +389,7 @@ pub async fn ai_shard_nodes(
             e.shard_ready
                 && !e.throttled
                 && e.iroh_node_id.is_some()
-                // шард рекламирует alias@a..b (голый alias только у полных нод),
+                // шард рекламирует alias@a..b (голый alias - только у полных нод),
                 // поэтому матчим и точное имя, и префикс "alias@"
                 && q.model
                     .as_ref()
@@ -418,7 +418,7 @@ pub async fn ai_shard_nodes(
 pub struct AiNodeOut {
     /// STH-адрес ноды
     node: String,
-    /// iroh NodeId воркера (ai://-адрес; None у чистой телеметрии) —
+    /// iroh NodeId воркера (ai://-адрес; None у чистой телеметрии) -
     /// нужен внешним провайдерам (ntfry-ai) для прямого подключения
     iroh_node_id: Option<String>,
     /// версия бинарника (None у старых нод)
@@ -470,17 +470,17 @@ pub struct AiStatsOut {
     total_threads: u64,
     total_ram_gb: f64,
     total_ram_free_gb: f64,
-    /// alias → число нод с этой моделью (шарды считаются по базовому имени)
+    /// alias -> число нод с этой моделью (шарды считаются по базовому имени)
     models: std::collections::HashMap<String, u64>,
     /// нод, ждущих LoadShard (--shard-auto)
     shard_ready_nodes: u64,
-    /// загруженных шардовых диапазонов (alias@a..b) активные конвейеры
+    /// загруженных шардовых диапазонов (alias@a..b) - активные конвейеры
     active_shards: u64,
     /// активные конвейеры по моделям: шарды, диапазоны слоёв, полные ноды
     pipelines: Vec<PipelineOut>,
     /// список активных нод с версиями (для UI, до 200 последних)
     nodes: Vec<AiNodeOut>,
-    /// каталог опубликованных моделей: alias → тикет (publish-model --alias)
+    /// каталог опубликованных моделей: alias -> тикет (publish-model --alias)
     model_tickets: Vec<ModelTicketOut>,
     updated_at: u64,
 }
@@ -533,7 +533,7 @@ pub async fn ai_stats(State(state): State<AppState>) -> Json<AiStatsOut> {
             .collect();
         out.model_tickets.sort_by(|a, b| b.registered_at.cmp(&a.registered_at));
     }
-    // model → агрегат маркетплейса (шарды, диапазоны, ноды, tok/s, цена)
+    // model -> агрегат маркетплейса (шарды, диапазоны, ноды, tok/s, цена)
     #[derive(Default)]
     struct PAgg {
         shards: u64,
@@ -575,7 +575,7 @@ pub async fn ai_stats(State(state): State<AppState>) -> Json<AiStatsOut> {
             } else {
                 *out.models.entry(m.clone()).or_insert(0) += 1;
                 let ent = pmap.entry(m.clone()).or_default();
-                // шард-ноды рекламируют базовый alias для сборки конвейера —
+                // шард-ноды рекламируют базовый alias для сборки конвейера -
                 // «полными» исполнителями их не считаем
                 if !e.shard_ready {
                     ent.full_nodes += 1;

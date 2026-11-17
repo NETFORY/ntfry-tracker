@@ -1,13 +1,13 @@
 //! SmartHoldem sth-core hints (v1.8.0): адресные подсказки (relay/IP) для P2P-узлов
 //! `api://<EndpointId>/sth-core`, которые присылают сами клиенты после удачного
 //! соединения. Нужны как ЗАПАСНОЙ путь, когда discovery (DNS n0 / pkarr / DHT) не
-//! находит узел; безопасность не страдает iroh аутентифицирует узел по EndpointId
+//! находит узел; безопасность не страдает — iroh аутентифицирует узел по EndpointId
 //! (QUIC TLS), ложный адрес просто не подключится.
 //!
 //! * `POST /sth/hint`  `{ "id": "<hex64>", "addrs": ["relay:https://…", "ip:1.2.3.4:443"], "reporter": "…" }`
-//! * `GET  /sth/hints` -> `{ "ts": …, "nodes": [{ "id", "addrs", "reporters", "age" }] }`
+//! * `GET  /sth/hints` → `{ "ts": …, "nodes": [{ "id", "addrs", "reporters", "age" }] }`
 //!
-//! Записи живут `TTL_SECS` с последнего репорта, адреса объединение (реле первыми),
+//! Записи живут `TTL_SECS` с последнего репорта, адреса — объединение (реле первыми),
 //! не больше `MAX_ADDRS`; всего не больше `MAX_IDS` узлов (вытесняются самые старые).
 
 use axum::{extract::State, http::StatusCode, Json};
@@ -28,7 +28,7 @@ const TTL_SECS: u64 = 12 * 3600;
 const MAX_IDS: usize = 128;
 const MAX_ADDRS: usize = 8;
 const MAX_REPORTERS: usize = 64;
-/// Один репортёр не чаще раза в 30 с на узел.
+/// Один репортёр — не чаще раза в 30 с на узел.
 const MIN_REPORT_GAP: u64 = 30;
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,7 +99,7 @@ fn prune(map: &mut HashMap<String, HintEntry>, now: u64) {
     }
 }
 
-/// Объединить адреса: реле первыми, без дублей, не больше MAX_ADDRS; новые вперёд.
+/// Объединить адреса: реле первыми, без дублей, не больше MAX_ADDRS; новые — вперёд.
 fn merge_addrs(old: &[String], new: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for a in new.iter().chain(old.iter()) {
@@ -185,10 +185,10 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-//  v1.9.0: самоанонс провайдеров (`netfory-provider ≥ 0.7.0`) -> живой пул узлов.
-//  `POST /sth/announce` подписанный ed25519 heartbeat самого узла (id = pubkey),
-//  `GET  /sth/pool`     живые узлы (≤ POOL_TTL_SECS с последнего heartbeat'а) с
-//  адресами и списком провайдеров. Адреса также попадают в /sth/hints старые
+//  v1.9.0: самоанонс провайдеров (`netfory-provider ≥ 0.7.0`) → живой пул узлов.
+//  `POST /sth/announce` — подписанный ed25519 heartbeat самого узла (id = pubkey),
+//  `GET  /sth/pool`     — живые узлы (≤ POOL_TTL_SECS с последнего heartbeat'а) с
+//  адресами и списком провайдеров. Адреса также попадают в /sth/hints — старые
 //  клиенты (1.135.215+) получают их как подсказки.
 // ---------------------------------------------------------------------------
 
@@ -207,7 +207,7 @@ pub fn new_pool() -> SthPoolMap {
 pub struct PoolEntry {
     pub ver: String,
     pub providers: Vec<String>,
-    /// `relay:https://…` / `ip:host:port` формат peerbook клиента.
+    /// `relay:https://…` / `ip:host:port` — формат peerbook клиента.
     pub addrs: Vec<String>,
     pub ts: u64,
 }
@@ -228,7 +228,7 @@ pub struct SthAnnounce {
     pub sig: String,
 }
 
-/// Канон v1 1:1 с `netfory-provider/src/announce.rs::canon`.
+/// Канон v1 — 1:1 с `netfory-provider/src/announce.rs::canon`.
 fn sth_announce_canon(id: &str, ver: &str, ts: u64, providers: &[String], addrs: &[String], relay: &str) -> String {
     format!("sth-announce|{id}|{ver}|{ts}|{}|{}|{relay}", providers.join(","), addrs.join(","))
 }
@@ -287,7 +287,7 @@ pub async fn sth_announce(State(state): State<AppState>, Json(a): Json<SthAnnoun
     pool.insert(id.clone(), PoolEntry { ver, providers, addrs: addrs.clone(), ts: now });
     drop(pool);
 
-    // те же адреса в подсказки для клиентов без /sth/pool
+    // те же адреса — в подсказки для клиентов без /sth/pool
     if !addrs.is_empty() {
         let mut map = state.sth_hints.lock().unwrap();
         prune(&mut map, now);

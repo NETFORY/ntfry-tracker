@@ -8,7 +8,7 @@
 // был объяснён строкой в логе: perf-снимок процесса, лог паник и вотчдог,
 // который сам стучится на 127.0.0.1:<port>/health и печатает отчёт.
 //
-// Процесс НЕ завершается вотчдогом (по требованию оператора) только логи.
+// Процесс НЕ завершается вотчдогом (по требованию оператора) — только логи.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,7 +103,7 @@ pub fn proc_report() -> String {
     )
 }
 
-/// Возраст heartbeat async-задачи в секундах (u64::MAX задача ещё не стартовала).
+/// Возраст heartbeat async-задачи в секундах (u64::MAX — задача ещё не стартовала).
 pub fn heartbeat_age() -> u64 {
     let hb = HEARTBEAT.load(Ordering::Relaxed);
     if hb == 0 {
@@ -113,7 +113,7 @@ pub fn heartbeat_age() -> u64 {
 }
 
 /// Синхронная проба своего же HTTP-порта (без tokio и без reqwest/ureq, чтобы
-/// вотчдог не зависел от занятого рантайма). true пришёл ответ «200 OK».
+/// вотчдог не зависел от занятого рантайма). true — пришёл ответ «200 OK».
 pub fn probe_health(port: u16) -> bool {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut sock) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
